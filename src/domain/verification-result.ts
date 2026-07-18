@@ -1,2 +1,18 @@
-// 필수 검증의 관측 가능한 결과 상태를 정의한다
-export type VerificationResult = "pending" | "passed" | "failed" | "unobservable";
+// 표준 런타임 검증 결과와 작업 상태 집계 계약을 정의한다
+export type VerificationStatus = "pending" | "passed" | "failed" | "unobservable";
+
+export interface VerificationResult {
+  schemaVersion: 1;
+  taskId: string;
+  repository: string;
+  environment: "develop" | "prod";
+  commitSha: string;
+  status: "passed" | "failed" | "unobservable";
+  checks: Array<{
+    name: "deployment" | "ecs" | "alb" | "api" | "sentry";
+    status: "passed" | "failed" | "unobservable" | "skipped";
+    evidenceUrl?: string;
+    summary: string;
+  }>;
+  observedAt: string;
+}

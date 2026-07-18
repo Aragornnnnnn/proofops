@@ -107,7 +107,7 @@ describe("GET /health", () => {
 });
 
 describe("POST /mcp", () => {
-  it("초기화 후 정확히 네 MCP 도구를 공개한다", async () => {
+  it("초기화 후 정확히 다섯 MCP 도구를 공개한다", async () => {
     const sessionId = await initializeMcp();
 
     const toolsResponse = await postMcp(
@@ -126,13 +126,14 @@ describe("POST /mcp", () => {
           { name: "link_pull_request" },
           { name: "get_task_status" },
           { name: "record_progress" },
+          { name: "request_verification" },
         ],
       },
     });
-    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(4);
+    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(5);
   });
 
-  it("네 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
+  it("다섯 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
     const sessionId = await initializeMcp();
     const calls = [
       [
@@ -161,6 +162,17 @@ describe("POST /mcp", () => {
         "invalid-progress",
         "record_progress",
         { taskId: "missing-task", kind: "test", summary: "a".repeat(1_001) },
+        "INPUT_INVALID",
+      ],
+      [
+        "invalid-verification",
+        "request_verification",
+        {
+          taskId: "task-1",
+          repository: "Aragornnnnnn/landit-be",
+          environment: "stage",
+          commitSha: "not-a-sha",
+        },
         "INPUT_INVALID",
       ],
     ] as const;

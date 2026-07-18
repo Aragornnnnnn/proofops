@@ -54,6 +54,45 @@ describe("collectGitHubPages", () => {
 });
 
 describe("GitHubAppClient.getTaskSnapshot", () => {
+  it("저장소별 최신 verification run 실패를 작업 snapshot에 반영한다", async () => {
+    const database = {
+      prepare: (query: string) => ({
+        bind: () => ({
+          all: async () => ({
+            results: query.includes("verification_runs")
+              ? [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    status: "failed",
+                  },
+                ]
+              : [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                  },
+                ],
+          }),
+          first: async () => ({ expected_repositories: '["landit-be"]' }),
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    vi.spyOn(client, "getPullRequest").mockResolvedValue({
+      repository: "Aragornnnnnn/landit-be",
+      number: 11,
+      url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+      headSha: "current",
+      state: "merged",
+      review: "approved",
+      ci: "passed",
+    });
+
+    await expect(client.getTaskSnapshot("task-1")).resolves.toMatchObject({
+      requiredVerification: "failed",
+    });
+  });
+
   it("예상 저장소별 최신 연결 PR만 현재 상태로 조회한다", async () => {
     const database = {
       prepare: (query: string) => ({

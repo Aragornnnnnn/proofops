@@ -13,8 +13,10 @@ import {
   getTaskStatusInputSchema,
   progressNoteSchema,
   recordProgressInputSchema,
+  requestVerificationInputSchema,
   startTaskInputSchema,
   taskContextSchema,
+  verificationDispatchSchema,
 } from "./schemas";
 
 export interface ProgressNote {
@@ -39,6 +41,12 @@ export interface ProofOpsTools {
     summary: string;
     evidenceUrl?: string;
   }): Promise<ProgressNote>;
+  requestVerification(input: {
+    taskId: string;
+    repository: string;
+    environment: "develop" | "prod";
+    commitSha: string;
+  }): Promise<{ workflowRunUrl: string }>;
 }
 
 export function createProofOpsTools(env: Env): ProofOpsTools {
@@ -80,6 +88,19 @@ export function createProofOpsTools(env: Env): ProofOpsTools {
         )
         .run();
       return note;
+    },
+    async requestVerification(input) {
+      await tasks.getContext(input.taskId);
+      const linkedCommit = await env.DB
+        .prepare(
+          `SELECT 1 AS linked FROM pull_requests
+           WHERE task_id = ? AND lower(repository) = lower(?)
+             AND lower(head_sha) = lower(?) LIMIT 1`,
+        )
+        .bind(input.taskId, input.repository, input.commitSha)
+        .first<{ linked: number }>();
+      if (!linkedCommit) throw new Error("INPUT_INVALID");
+      return github.dispatchVerification(input);
     },
   };
 }
@@ -141,6 +162,21 @@ export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): 
         : inputInvalidResult();
     },
   );
+  server.registerTool(
+    "request_verification",
+    {
+      description:
+        "연결된 commit에 대해 허용된 GitHub Actions 읽기 전용 검증을 요청한다.",
+      inputSchema: mcpRequestVerificationInputSchema,
+      outputSchema: verificationDispatchSchema,
+    },
+    async (input) => {
+      const parsed = requestVerificationInputSchema.safeParse(input);
+      return parsed.success
+        ? toToolResult(() => tools.requestVerification(parsed.data))
+        : inputInvalidResult();
+    },
+  );
 }
 
 const mcpStartTaskInputSchema = z.object({
@@ -166,6 +202,13 @@ const mcpRecordProgressInputSchema = z.object({
   kind: z.string().catch(""),
   summary: z.string().catch(""),
   evidenceUrl: z.string().optional().catch(""),
+});
+
+const mcpRequestVerificationInputSchema = z.object({
+  taskId: z.string().catch(""),
+  repository: z.string().catch(""),
+  environment: z.string().catch(""),
+  commitSha: z.string().catch(""),
 });
 
 async function toToolResult<T>(action: () => Promise<T>): Promise<CallToolResult> {
@@ -202,6 +245,7 @@ function toSafeMcpErrorCode(error: unknown):
       : undefined;
   if (message === "NOTION_READ_FAILED") return "NOTION_READ_FAILED";
   if (message === "GITHUB_READ_FAILED") return "GITHUB_READ_FAILED";
+  if (message === "GITHUB_API_FAILED") return "GITHUB_READ_FAILED";
   if (message === "GITHUB_REPOSITORY_NOT_ALLOWED") {
     return "GITHUB_REPOSITORY_NOT_ALLOWED";
   }

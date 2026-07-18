@@ -1,5 +1,7 @@
 // GitHub App 인증으로 Pull Request의 현재 리뷰와 Check 상태를 조회한다
 import { createAppAuth } from "@octokit/auth-app";
+import { strFromU8, unzipSync } from "fflate";
+import adapter from "../../landit/adapter.json";
 import type { PullRequestSnapshot, TaskSnapshot } from "../domain/types";
 import type { Env } from "../env";
 import { parsePullRequestUrl } from "./events";
@@ -15,7 +17,7 @@ export interface VerificationRequest {
   taskId: string;
   repository: string;
   environment: "develop" | "prod";
-  ref: string;
+  commitSha: string;
 }
 
 export interface GitHubPort {
@@ -24,6 +26,10 @@ export interface GitHubPort {
   dispatchVerification(
     input: VerificationRequest,
   ): Promise<{ workflowRunUrl: string }>;
+  getVerificationArtifact(input: {
+    repository: string;
+    workflowRunId: number;
+  }): Promise<unknown>;
 }
 
 interface GitHubAppConfig {
@@ -143,33 +149,201 @@ export class GitHubAppClient implements GitHubPort {
     const pullRequests = await Promise.all(
       [...latestPullRequestUrls.values()].map((prUrl) => this.getPullRequest(prUrl)),
     );
+    const verificationRows = await this.db
+      .prepare(
+        `SELECT repository, status FROM verification_runs
+         WHERE task_id = ? ORDER BY created_at DESC, workflow_run_id DESC`,
+      )
+      .bind(taskId)
+      .all<{ repository: string; status: string }>();
+    const latestVerificationByRepository = new Map<string, "passed" | "failed">();
+    for (const row of verificationRows.results) {
+      const name = repositoryName(row.repository);
+      if (
+        !latestVerificationByRepository.has(name) &&
+        (row.status === "passed" || row.status === "failed")
+      ) {
+        latestVerificationByRepository.set(name, row.status);
+      }
+    }
+    const requiredRepositoryNames =
+      expectedNames.size > 0
+        ? [...expectedNames]
+        : [...latestPullRequestUrls.keys()];
+    const verificationStatuses = requiredRepositoryNames
+      .map((name) => latestVerificationByRepository.get(name))
+      .filter((status): status is "passed" | "failed" => status !== undefined);
+    const requiredVerification = verificationStatuses.includes("failed")
+      ? "failed"
+      : requiredRepositoryNames.length > 0 &&
+          verificationStatuses.length === requiredRepositoryNames.length
+        ? "passed"
+        : "pending";
     return {
       started: true,
       expectedRepositories,
       pullRequests,
-      deployment: "none",
-      requiredVerification: "pending",
+      deployment: requiredVerification === "passed" ? "succeeded" : "none",
+      requiredVerification,
     };
   }
 
   async dispatchVerification(
-    _input: VerificationRequest,
+    input: VerificationRequest,
   ): Promise<{ workflowRunUrl: string }> {
-    throw new Error("GITHUB_VERIFICATION_NOT_AVAILABLE");
+    const [owner, repositoryName] = assertVerificationRequest(input);
+    const token = await this.getInstallationToken(owner, repositoryName);
+    const workflow = adapter.verificationWorkflow;
+    await this.requestVoid(
+      `/repos/${owner}/${repositoryName}/actions/workflows/${workflow}/dispatches`,
+      token,
+      {
+        ref: input.commitSha,
+        inputs: {
+          task_id: input.taskId,
+          environment: input.environment,
+          commit_sha: input.commitSha,
+        },
+      },
+    );
+    return {
+      workflowRunUrl: `https://github.com/${owner}/${repositoryName}/actions/workflows/${workflow}`,
+    };
+  }
+
+  async getVerificationArtifact(input: {
+    repository: string;
+    workflowRunId: number;
+  }): Promise<unknown> {
+    const [owner, repositoryName] = assertAllowedRepository(input.repository);
+    if (!Number.isSafeInteger(input.workflowRunId) || input.workflowRunId < 1) {
+      throw new Error("INPUT_INVALID");
+    }
+    const token = await this.getInstallationToken(owner, repositoryName);
+    const artifacts = await this.request<{
+      artifacts: Array<{ id: number; name: string; expired: boolean }>;
+    }>(
+      `/repos/${owner}/${repositoryName}/actions/runs/${input.workflowRunId}/artifacts?per_page=100`,
+      token,
+    );
+    const artifact = artifacts.artifacts.find(
+      (candidate) =>
+        candidate.name === "proofops-verification" && !candidate.expired,
+    );
+    if (!artifact) throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+
+    const response = await this.fetcher(
+      `https://api.github.com/repos/${owner}/${repositoryName}/actions/artifacts/${artifact.id}/zip`,
+      {
+        headers: this.githubHeaders(token),
+        redirect: "follow",
+      },
+    );
+    if (!response.ok) throw new Error("GITHUB_API_FAILED");
+    const declaredSize = Number(response.headers.get("content-length") ?? "0");
+    if (declaredSize > 1_048_576) {
+      throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+    }
+    const archive = new Uint8Array(await response.arrayBuffer());
+    if (archive.byteLength > 1_048_576) {
+      throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+    }
+    try {
+      let matchedFiles = 0;
+      const files = unzipSync(archive, {
+        filter: (file) => {
+          if (file.name !== "proofops-verification-result.json") return false;
+          matchedFiles += 1;
+          if (file.originalSize > 262_144) {
+            throw new Error("artifact too large");
+          }
+          return true;
+        },
+      });
+      const result = files["proofops-verification-result.json"];
+      if (matchedFiles !== 1 || !result) throw new Error("artifact missing");
+      return JSON.parse(strFromU8(result));
+    } catch {
+      throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+    }
+  }
+
+  private async getInstallationToken(
+    owner: string,
+    repositoryName: string,
+  ): Promise<string> {
+    const auth = createAppAuth({
+      appId: this.config.appId,
+      privateKey: this.config.privateKey.replaceAll("\\n", "\n"),
+    });
+    const appAuthentication = await auth({ type: "app" });
+    const installation = await this.request<{ id: number }>(
+      `/repos/${owner}/${repositoryName}/installation`,
+      appAuthentication.token,
+    );
+    const installationAuthentication = await auth({
+      type: "installation",
+      installationId: installation.id,
+    });
+    return installationAuthentication.token;
   }
 
   private async request<T>(path: string, token: string): Promise<T> {
     const response = await this.fetcher(`https://api.github.com${path}`, {
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${token}`,
-        "user-agent": "proofops",
-        "x-github-api-version": "2022-11-28",
-      },
+      headers: this.githubHeaders(token),
     });
     if (!response.ok) throw new Error("GITHUB_API_FAILED");
     return (await response.json()) as T;
   }
+
+  private githubHeaders(token: string): Record<string, string> {
+    return {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "user-agent": "proofops",
+      "x-github-api-version": "2022-11-28",
+    };
+  }
+
+  private async requestVoid(
+    path: string,
+    token: string,
+    body: unknown,
+  ): Promise<void> {
+    const response = await this.fetcher(`https://api.github.com${path}`, {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "user-agent": "proofops",
+        "x-github-api-version": "2022-11-28",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error("GITHUB_API_FAILED");
+  }
+}
+
+function assertVerificationRequest(input: VerificationRequest): [string, string] {
+  const [owner, repositoryName] = assertAllowedRepository(input.repository);
+  if (
+    (input.environment !== "develop" && input.environment !== "prod") ||
+    !input.taskId.trim() ||
+    !/^[0-9a-f]{40}$/i.test(input.commitSha)
+  ) {
+    throw new Error("INPUT_INVALID");
+  }
+  return [owner, repositoryName];
+}
+
+function assertAllowedRepository(repository: string): [string, string] {
+  const allowedRepository = adapter.allowedRepositories.find(
+    (allowed) => allowed.toLowerCase() === repository.toLowerCase(),
+  );
+  if (!allowedRepository) throw new Error("GITHUB_REPOSITORY_NOT_ALLOWED");
+  const [owner, repositoryName] = allowedRepository.split("/");
+  return [owner, repositoryName];
 }
 
 function repositoryName(repository: string): string {

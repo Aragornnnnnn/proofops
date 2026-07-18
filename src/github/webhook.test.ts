@@ -5,11 +5,49 @@ import checkRunFailed from "../../test/fixtures/github-check-run-failed.json";
 import pullRequestOpened from "../../test/fixtures/github-pull-request-opened.json";
 import reviewChangesRequested from "../../test/fixtures/github-review-changes-requested.json";
 import type { TaskSnapshot } from "../domain/types";
+import type { VerificationResult } from "../domain/verification-result";
 import type { GitHubPort, LinkedPullRequestSnapshot } from "./app-client";
 import { handleGitHubWebhook, linkPullRequest } from "./webhook";
 
 const secret = "webhook-test-secret";
 const timestamp = "2026-07-18T00:00:00.000Z";
+const verificationSha = "0123456789abcdef0123456789abcdef01234567";
+const verificationArtifact: VerificationResult = {
+  schemaVersion: 1,
+  taskId: "task-1",
+  repository: "Aragornnnnnn/landit-be",
+  environment: "develop",
+  commitSha: verificationSha,
+  status: "passed",
+  checks: [
+    {
+      name: "deployment",
+      status: "passed",
+      evidenceUrl: "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+      summary: "배포가 안정 상태다.",
+    },
+    {
+      name: "ecs",
+      status: "passed",
+      evidenceUrl: "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+      summary: "ECS 서비스가 안정 상태다.",
+    },
+    {
+      name: "alb",
+      status: "passed",
+      evidenceUrl: "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+      summary: "ALB 대상이 healthy 상태다.",
+    },
+    {
+      name: "api",
+      status: "passed",
+      evidenceUrl: "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+      summary: "상태 확인 API가 성공했다.",
+    },
+    { name: "sentry", status: "skipped", summary: "선택 관측 항목이다." },
+  ],
+  observedAt: timestamp,
+};
 const currentPullRequest: LinkedPullRequestSnapshot = {
   repository: "Aragornnnnnn/landit-be",
   number: 42,
@@ -37,6 +75,7 @@ function githubStub(
       pullRequests: [pullRequest],
     }),
     dispatchVerification: vi.fn().mockRejectedValue(new Error("not used")),
+    getVerificationArtifact: vi.fn().mockRejectedValue(new Error("not used")),
   };
 }
 
@@ -163,12 +202,25 @@ beforeEach(async () => {
         received_at TEXT NOT NULL,
         PRIMARY KEY(provider, delivery_id)
       )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS verification_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        repository TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        workflow_run_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        evidence_url TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`),
   ]);
 });
 
 afterEach(async () => {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM pull_requests"),
+    env.DB.prepare("DELETE FROM verification_runs"),
     env.DB.prepare("DELETE FROM webhook_deliveries"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);
@@ -355,6 +407,220 @@ describe("handleGitHubWebhook", () => {
 
     expect(response.status).toBe(202);
     await expect(response.json()).resolves.toEqual({ status: "ignored" });
+  });
+
+  it("PR 참조가 없는 검증 workflow_run도 연결된 repository와 SHA로 결과를 저장한다", async () => {
+    await insertTaskAndPullRequest();
+    await env.DB
+      .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
+      .bind(verificationSha, "pr-1")
+      .run();
+    const github = githubStub() as GitHubPort & {
+      getVerificationArtifact: ReturnType<typeof vi.fn>;
+    };
+    github.getVerificationArtifact = vi.fn().mockResolvedValue(verificationArtifact);
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest("workflow_run", "delivery-verification", {
+        action: "completed",
+        workflow_run: {
+          id: 101,
+          path: ".github/workflows/proofops-verify.yml",
+          head_sha: verificationSha,
+          html_url:
+            "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+          pull_requests: [],
+        },
+        repository: { full_name: "Aragornnnnnn/landit-be" },
+      }),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "processed" });
+    expect(github.getVerificationArtifact).toHaveBeenCalledWith({
+      repository: "Aragornnnnnn/landit-be",
+      workflowRunId: 101,
+    });
+    await expect(
+      env.DB
+        .prepare(
+          "SELECT task_id, repository, environment, workflow_run_id, status, evidence_url, result_json FROM verification_runs",
+        )
+        .first(),
+    ).resolves.toEqual({
+      task_id: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      environment: "develop",
+      workflow_run_id: 101,
+      status: "passed",
+      evidence_url:
+        "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
+      result_json: JSON.stringify(verificationArtifact),
+    });
+  });
+
+  it("필수 check가 unobservable인 결과는 Failed 상태로 수렴한다", async () => {
+    await insertTaskAndPullRequest();
+    await env.DB
+      .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
+      .bind(verificationSha, "pr-1")
+      .run();
+    const github = githubStub() as GitHubPort & {
+      getVerificationArtifact: ReturnType<typeof vi.fn>;
+    };
+    github.getVerificationArtifact = vi.fn().mockResolvedValue({
+      ...verificationArtifact,
+      status: "unobservable",
+      checks: verificationArtifact.checks.map((check) =>
+        check.name === "ecs"
+          ? { ...check, status: "unobservable", summary: "ECS를 관측하지 못했다." }
+          : check,
+      ),
+    });
+    vi.mocked(github.getTaskSnapshot).mockImplementation(async () => {
+      const run = await env.DB
+        .prepare("SELECT status FROM verification_runs WHERE task_id = ?")
+        .bind("task-1")
+        .first<{ status: "passed" | "failed" }>();
+      return {
+        ...currentTaskSnapshot,
+        pullRequests: [
+          { ...currentPullRequest, state: "merged", review: "approved", ci: "passed" },
+        ],
+        deployment: "succeeded",
+        requiredVerification: run?.status ?? "pending",
+      };
+    });
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest("workflow_run", "delivery-unobservable", {
+        action: "completed",
+        workflow_run: {
+          id: 102,
+          path: ".github/workflows/proofops-verify.yml",
+          head_sha: verificationSha,
+          html_url:
+            "https://github.com/Aragornnnnnn/landit-be/actions/runs/102",
+          pull_requests: [],
+        },
+        repository: { full_name: "Aragornnnnnn/landit-be" },
+      }),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(
+      env.DB.prepare("SELECT status FROM verification_runs").first(),
+    ).resolves.toEqual({ status: "failed" });
+    await expect(
+      env.DB
+        .prepare("SELECT technical_status FROM tasks WHERE id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({ technical_status: "Failed" });
+  });
+
+  it("문맥이 확인된 invalid artifact는 원문 없이 안전한 실패로 수렴한다", async () => {
+    await insertTaskAndPullRequest();
+    await env.DB
+      .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
+      .bind(verificationSha, "pr-1")
+      .run();
+    const github = githubStub();
+    vi.mocked(github.getVerificationArtifact).mockResolvedValue({
+      ...verificationArtifact,
+      taskId: "attacker-task",
+      checks: [
+        {
+          name: "api",
+          status: "passed",
+          summary: "AWS_ACCESS_KEY_ID=AKIA0123456789ABCDEF",
+        },
+      ],
+    });
+    vi.mocked(github.getTaskSnapshot).mockImplementation(async () => {
+      const run = await env.DB
+        .prepare("SELECT status FROM verification_runs WHERE task_id = ?")
+        .bind("task-1")
+        .first<{ status: "failed" }>();
+      return {
+        ...currentTaskSnapshot,
+        requiredVerification: run?.status ?? "pending",
+      };
+    });
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest("workflow_run", "delivery-invalid-artifact", {
+        action: "completed",
+        workflow_run: {
+          id: 103,
+          path: ".github/workflows/proofops-verify.yml",
+          head_sha: verificationSha,
+          pull_requests: [],
+        },
+        repository: { full_name: "Aragornnnnnn/landit-be" },
+      }),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "processed" });
+    await expect(
+      env.DB
+        .prepare("SELECT environment, status, result_json FROM verification_runs")
+        .first(),
+    ).resolves.toEqual({
+      environment: "unknown",
+      status: "failed",
+      result_json: JSON.stringify({ error: "VERIFICATION_ARTIFACT_INVALID" }),
+    });
+    await expect(
+      env.DB
+        .prepare("SELECT technical_status FROM tasks WHERE id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({ technical_status: "Failed" });
+  });
+
+  it("artifact API의 일시 실패는 delivery를 되돌리고 재시도한다", async () => {
+    await insertTaskAndPullRequest();
+    await env.DB
+      .prepare("UPDATE pull_requests SET head_sha = ? WHERE id = ?")
+      .bind(verificationSha, "pr-1")
+      .run();
+    const github = githubStub();
+    vi.mocked(github.getVerificationArtifact).mockRejectedValue(
+      new Error("GITHUB_API_FAILED"),
+    );
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest("workflow_run", "delivery-artifact-retry", {
+        action: "completed",
+        workflow_run: {
+          id: 104,
+          path: ".github/workflows/proofops-verify.yml",
+          head_sha: verificationSha,
+          pull_requests: [],
+        },
+        repository: { full_name: "Aragornnnnnn/landit-be" },
+      }),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ status: "retry" });
+    await expect(
+      env.DB.prepare("SELECT COUNT(*) AS count FROM verification_runs").first(),
+    ).resolves.toEqual({ count: 0 });
+    await expect(
+      env.DB
+        .prepare(
+          "SELECT COUNT(*) AS count FROM webhook_deliveries WHERE delivery_id = ?",
+        )
+        .bind("delivery-artifact-retry")
+        .first(),
+    ).resolves.toEqual({ count: 0 });
   });
 });
 

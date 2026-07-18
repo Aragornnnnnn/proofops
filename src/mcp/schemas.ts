@@ -33,6 +33,13 @@ export const recordProgressInputSchema = z.object({
     .optional(),
 });
 
+export const requestVerificationInputSchema = z.object({
+  taskId: z.string().trim().min(1).max(200),
+  repository: z.string().regex(/^[^/\s]+\/[^/\s]+$/),
+  environment: z.enum(["develop", "prod"]),
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/i),
+});
+
 export const taskContextSchema = z.object({
   id: z.string(),
   notionPageId: z.string(),
@@ -51,4 +58,8 @@ export const progressNoteSchema = z.object({
   summary: z.string(),
   evidenceUrl: z.string().nullable(),
   createdAt: z.string(),
+});
+
+export const verificationDispatchSchema = z.object({
+  workflowRunUrl: z.string().url(),
 });

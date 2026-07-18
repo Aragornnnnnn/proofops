@@ -1,5 +1,5 @@
 // ProofOps 작업의 외부 증거와 기술 상태 타입을 정의한다
-import type { VerificationResult } from "./verification-result";
+import type { VerificationStatus } from "./verification-result";
 
 export type TechnicalStatus =
   | "In Progress"
@@ -23,5 +23,5 @@ export interface TaskSnapshot {
   expectedRepositories: string[];
   pullRequests: PullRequestSnapshot[];
   deployment: "none" | "running" | "succeeded" | "failed";
-  requiredVerification: VerificationResult;
+  requiredVerification: VerificationStatus;
 }
