@@ -11,7 +11,7 @@
 | 클라이언트 문서 검사 | `npm run check:client-docs` | 성공. 종료 코드 0. |
 | 로컬 D1 마이그레이션 | `npx wrangler d1 migrations apply proofops-local --local` | 성공. 로컬 `.wrangler/state/v3/d1`에 `0002_pull_request_linked_at.sql`부터 `0006_operation_lifecycle.sql`까지 적용되었다. |
 | 작업 트리 공백 검사 | `git diff --check` | 성공. 종료 코드 0. |
-| Worker 번들 dry-run | `npx wrangler deploy --dry-run` | 실패. 종료 코드 1. `node_modules/mimetext/node_modules/mime-types/index.js`의 Node 내장 모듈 `path`를 해석하지 못했다. Wrangler는 `nodejs_compat` compatibility flag를 요구한다. |
+| Worker 번들 dry-run | `npx wrangler deploy --dry-run` | 성공. 종료 코드 0. `nodejs_compat` compatibility flag 추가 뒤 2,527.47 KiB Worker 번들을 생성하고 `--dry-run: exiting now.`를 출력했다. 실제 배포는 수행하지 않았다. |
 
 처음 sandbox에서 실행한 Worker 테스트와 로컬 D1 마이그레이션은 Wrangler가 loopback 포트와 사용자 Wrangler 로그 경로에 접근하지 못해 `EPERM`으로 실패했다. 동일한 로컬 명령을 권한이 허용된 환경에서 재실행한 결과는 위 표와 같다.
 
@@ -30,7 +30,6 @@
 
 ## 배포 및 실제 검증 blocker
 
-1. `npx wrangler deploy --dry-run`이 `path` 미해결로 실패한다. preview 배포 전에 Worker 런타임 호환성 문제를 수정하고 dry-run을 다시 통과시켜야 한다.
-2. 현재 `wrangler.jsonc`은 로컬 placeholder D1/KV ID만 포함한다. preview D1 database ID, OAuth KV namespace ID와 배포할 Worker 이름 또는 환경 설정이 필요하다.
-3. GitHub OAuth, GitHub App, Notion, Sentry, Webhook 서명 검증에 필요한 secret과 테스트용 외부 리소스가 제공되지 않았다.
-4. 위 blocker가 해소된 뒤에만 실제 preview 배포, 두 MCP 클라이언트 OAuth, Webhook 재전송, workflow artifact, 상태 전이 및 로그/D1 민감정보 검사를 수행할 수 있다.
+1. 현재 `wrangler.jsonc`은 로컬 placeholder D1/KV ID만 포함한다. preview D1 database ID, OAuth KV namespace ID와 배포할 Worker 이름 또는 환경 설정이 필요하다.
+2. GitHub OAuth, GitHub App, Notion, Sentry, Webhook 서명 검증에 필요한 secret과 테스트용 외부 리소스가 제공되지 않았다.
+3. 위 blocker가 해소된 뒤에만 실제 preview 배포, 두 MCP 클라이언트 OAuth, Webhook 재전송, workflow artifact, 상태 전이 및 로그/D1 민감정보 검사를 수행할 수 있다.
