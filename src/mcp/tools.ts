@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import adapter from "../../landit/adapter.json";
+import type { Actor } from "../auth/authorization";
 import type { Env } from "../env";
 import { createGitHubClient, type GitHubPort } from "../github/app-client";
 import { linkPullRequest, reconcileTask } from "../github/webhook";
@@ -63,6 +64,7 @@ export interface ProofOpsTools {
 
 export function createProofOpsTools(
   env: Env,
+  actor: Actor,
   dependencies?: {
     github?: GitHubPort;
     notion?: NotionPort;
@@ -76,11 +78,23 @@ export function createProofOpsTools(
   const taskService = new TaskService(tasks, notion, (taskId) =>
     reconcileTask({ db: env.DB, github, notion }, taskId),
   );
+  const audit = (
+    action: MutationAction,
+    resourceType: MutationResourceType,
+    resourceId: string,
+  ) => recordAuditEvent(env.DB, actor, action, resourceType, resourceId);
 
   return {
-    startTask: ({ notionPageIdOrUrl }) => taskService.startTask(notionPageIdOrUrl),
-    linkPullRequest: (input) =>
-      linkPullRequest(input, { db: env.DB, github, notion }),
+    async startTask({ notionPageIdOrUrl }) {
+      const task = await taskService.startTask(notionPageIdOrUrl);
+      await audit("start_task", "task", task.id);
+      return task;
+    },
+    async linkPullRequest(input) {
+      const task = await linkPullRequest(input, { db: env.DB, github, notion });
+      await audit("link_pull_request", "task", task.id);
+      return task;
+    },
     getTaskStatus: ({ taskId }) => taskService.getTaskStatus(taskId),
     async recordProgress({ taskId, kind, summary, evidenceUrl }) {
       await tasks.getContext(taskId);
@@ -95,8 +109,9 @@ export function createProofOpsTools(
       };
       await env.DB
         .prepare(
-          `INSERT INTO progress_notes (id, task_id, kind, summary, evidence_url, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO progress_notes (
+             id, task_id, kind, summary, evidence_url, actor_github_user_id, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           note.id,
@@ -104,19 +119,71 @@ export function createProofOpsTools(
           note.kind,
           note.summary,
           note.evidenceUrl,
+          actor.githubUserId,
           note.createdAt,
         )
         .run();
+      await audit("record_progress", "progress_note", note.id);
       return note;
     },
     async requestVerification(input) {
       await tasks.getContext(input.taskId);
-      return requestVerification(input, { db: env.DB, github });
+      const verification = await requestVerification(input, {
+        db: env.DB,
+        github,
+      });
+      await audit(
+        "request_verification",
+        "verification_request",
+        verification.requestId,
+      );
+      return verification;
     },
     investigateIncident: ({ sentryIssueUrlOrId }) =>
       sentry.investigateIncident(sentryIssueUrlOrId),
-    createNotionIssue: (input) => notion.createIssue(input),
+    async createNotionIssue(input) {
+      const issue = await notion.createIssue(input);
+      await audit("create_notion_issue", "notion_issue", issue.pageId);
+      return issue;
+    },
   };
+}
+
+type MutationAction =
+  | "start_task"
+  | "link_pull_request"
+  | "record_progress"
+  | "request_verification"
+  | "create_notion_issue";
+
+type MutationResourceType =
+  | "task"
+  | "progress_note"
+  | "verification_request"
+  | "notion_issue";
+
+async function recordAuditEvent(
+  db: D1Database,
+  actor: Actor,
+  action: MutationAction,
+  resourceType: MutationResourceType,
+  resourceId: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO audit_events (
+         event_id, actor_github_user_id, action, resource_type, resource_id, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      actor.githubUserId,
+      action,
+      resourceType,
+      resourceId,
+      new Date().toISOString(),
+    )
+    .run();
 }
 
 export async function requestVerification(

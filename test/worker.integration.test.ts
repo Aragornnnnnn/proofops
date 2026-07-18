@@ -7,12 +7,19 @@ const mcpHeaders = {
   accept: "application/json, text/event-stream",
   "content-type": "application/json",
 };
+const sessionTokens = new Map<string, string>();
 
-async function postMcp(message: unknown, sessionId?: string): Promise<Response> {
+async function postMcp(
+  message: unknown,
+  sessionId?: string,
+  accessToken?: string,
+): Promise<Response> {
+  const bearerToken = accessToken ?? (sessionId ? sessionTokens.get(sessionId) : undefined);
   return SELF.fetch("https://proofops.test/mcp", {
     method: "POST",
     headers: {
       ...mcpHeaders,
+      ...(bearerToken ? { authorization: `Bearer ${bearerToken}` } : {}),
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     body: JSON.stringify(message),
@@ -30,7 +37,175 @@ async function readMcpResponse(response: Response): Promise<Record<string, unkno
   return JSON.parse(data) as Record<string, unknown>;
 }
 
-async function initializeMcp(): Promise<string> {
+interface AuthorizationFixture {
+  clientId: string;
+  verifier: string;
+  downstreamRedirectUri: string;
+  githubState: string;
+}
+
+interface ConsentForm {
+  actorGithubUserId: string;
+  clientId: string;
+  csrfToken: string;
+  redirectUri: string;
+  scopes: string;
+}
+
+async function beginAuthorization(scope = "mcp"): Promise<AuthorizationFixture> {
+  const downstreamRedirectUri = "https://client.example/oauth/callback";
+  const clientId = await registerOAuthClient(downstreamRedirectUri);
+  const verifier = "proofops-test-verifier-abcdefghijklmnopqrstuvwxyz123456";
+  const authorizeUrl = await authorizationUrl(clientId, downstreamRedirectUri, verifier, scope);
+
+  const response = await SELF.fetch(authorizeUrl, { redirect: "manual" });
+  expect(response.status).toBe(302);
+  const githubUrl = new URL(requiredHeader(response, "location"));
+  expect(githubUrl.origin).toBe("https://github.com");
+  expect(githubUrl.pathname).toBe("/login/oauth/authorize");
+
+  return {
+    clientId,
+    verifier,
+    downstreamRedirectUri,
+    githubState: requiredQuery(githubUrl, "state"),
+  };
+}
+
+async function registerOAuthClient(redirectUri: string): Promise<string> {
+  const registration = await SELF.fetch("https://proofops.test/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_name: "ProofOps test client",
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: "none",
+    }),
+  });
+  expect(registration.status).toBe(201);
+  const { client_id: clientId } = (await registration.json()) as { client_id: string };
+  return clientId;
+}
+
+async function authorizationUrl(
+  clientId: string,
+  redirectUri: string,
+  verifier: string,
+  scope: string,
+): Promise<URL> {
+  const challenge = await pkceChallenge(verifier);
+  const authorizeUrl = new URL("https://proofops.test/authorize");
+  authorizeUrl.search = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope,
+    state: "downstream-state",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+  return authorizeUrl;
+}
+
+async function renderConsent(
+  fixture: AuthorizationFixture,
+  profile: { id: number; login: string } = { id: 101, login: "Alice" },
+): Promise<Response> {
+  const previousFetch = globalThis.fetch;
+  const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === "https://github.com/login/oauth/access_token") {
+      return Response.json({ access_token: "github-access-token", token_type: "bearer" });
+    }
+    if (url === "https://api.github.com/user") return Response.json(profile);
+    throw new Error(`Unexpected upstream request: ${url}`);
+  });
+  vi.stubGlobal("fetch", upstreamFetch);
+  try {
+    return await SELF.fetch(
+      `https://proofops.test/oauth/callback?code=github-code&state=${encodeURIComponent(fixture.githubState)}`,
+    );
+  } finally {
+    vi.stubGlobal("fetch", previousFetch);
+  }
+}
+
+async function approvedAccessToken(): Promise<string> {
+  const fixture = await beginAuthorization();
+  const consent = await renderConsent(fixture);
+  expect(consent.status).toBe(200);
+  const form = parseConsentForm(await consent.text());
+  const approved = await submitConsent(form, "approve");
+  expect(approved.status).toBe(302);
+  const downstream = new URL(requiredHeader(approved, "location"));
+  const code = requiredQuery(downstream, "code");
+  const token = await SELF.fetch("https://proofops.test/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: fixture.clientId,
+      code,
+      redirect_uri: fixture.downstreamRedirectUri,
+      code_verifier: fixture.verifier,
+    }),
+  });
+  expect(token.status).toBe(200);
+  const body = (await token.json()) as { access_token: string };
+  return body.access_token;
+}
+
+async function submitConsent(
+  form: ConsentForm,
+  decision: "approve" | "deny",
+  overrides: Partial<ConsentForm> = {},
+): Promise<Response> {
+  return SELF.fetch("https://proofops.test/authorize", {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ ...form, ...overrides, decision }),
+  });
+}
+
+function parseConsentForm(html: string): ConsentForm {
+  return {
+    actorGithubUserId: hiddenValue(html, "actorGithubUserId"),
+    clientId: hiddenValue(html, "clientId"),
+    csrfToken: hiddenValue(html, "csrfToken"),
+    redirectUri: hiddenValue(html, "redirectUri"),
+    scopes: hiddenValue(html, "scopes"),
+  };
+}
+
+function hiddenValue(html: string, name: keyof ConsentForm): string {
+  const value = html.match(new RegExp(`name="${name}" value="([^"]*)"`))?.[1];
+  if (!value) throw new Error(`Consent form did not include ${name}`);
+  return value;
+}
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function requiredHeader(response: Response, name: string): string {
+  const value = response.headers.get(name);
+  if (!value) throw new Error(`Response did not include ${name}`);
+  return value;
+}
+
+function requiredQuery(url: URL, name: string): string {
+  const value = url.searchParams.get(name);
+  if (!value) throw new Error(`URL did not include ${name}`);
+  return value;
+}
+
+async function initializeMcp(accessToken?: string): Promise<string> {
+  const bearerToken = accessToken ?? (await approvedAccessToken());
   const response = await postMcp({
     jsonrpc: "2.0",
     id: "initialize",
@@ -40,11 +215,12 @@ async function initializeMcp(): Promise<string> {
       capabilities: {},
       clientInfo: { name: "proofops-test", version: "1.0.0" },
     },
-  });
+  }, undefined, bearerToken);
 
   expect(response.status).toBe(200);
   const sessionId = response.headers.get("mcp-session-id");
   if (!sessionId) throw new Error("MCP initialization did not provide a session ID");
+  sessionTokens.set(sessionId, bearerToken);
   await expect(readMcpResponse(response)).resolves.toMatchObject({
     jsonrpc: "2.0",
     id: "initialize",
@@ -54,6 +230,7 @@ async function initializeMcp(): Promise<string> {
 }
 
 beforeEach(async () => {
+  sessionTokens.clear();
   await env.DB.batch([
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS tasks (
@@ -72,8 +249,25 @@ beforeEach(async () => {
         kind TEXT NOT NULL,
         summary TEXT NOT NULL,
         evidence_url TEXT,
+      actor_github_user_id INTEGER,
       created_at TEXT NOT NULL
     )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS oauth_ephemeral_states (
+        token_hash TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS audit_events (
+        event_id TEXT PRIMARY KEY,
+        actor_github_user_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`),
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS pull_requests (
         id TEXT PRIMARY KEY,
@@ -90,6 +284,8 @@ beforeEach(async () => {
       )`),
     env.DB.prepare("DELETE FROM pull_requests"),
     env.DB.prepare("DELETE FROM progress_notes"),
+    env.DB.prepare("DELETE FROM oauth_ephemeral_states"),
+    env.DB.prepare("DELETE FROM audit_events"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);
 });
@@ -107,7 +303,199 @@ describe("GET /health", () => {
   });
 });
 
+describe("POST /webhooks/github", () => {
+  it("Bearer token 없이도 유효한 서명 요청을 처리한다", async () => {
+    const body = JSON.stringify({ zen: "Keep it logically awesome." });
+    const signature = await webhookSignature(body, env.GITHUB_WEBHOOK_SECRET);
+
+    const response = await SELF.fetch("https://proofops.test/webhooks/github", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "ping",
+        "x-hub-signature-256": signature,
+      },
+      body,
+    });
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "ignored" });
+  });
+});
+
+describe("GitHub OAuth consent", () => {
+  it("명시적 승인 전에는 downstream grant를 발급하지 않는다", async () => {
+    const before = await env.OAUTH_KV.list({ prefix: "grant:" });
+    const fixture = await beginAuthorization();
+    const response = await renderConsent(fixture);
+
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("ProofOps test client");
+    expect(html).toContain("https://client.example");
+    expect(html).toContain("mcp");
+    const after = await env.OAUTH_KV.list({ prefix: "grant:" });
+    expect(after.keys).toHaveLength(before.keys.length);
+  });
+
+  it("allowlist에 없는 GitHub 사용자는 동의 화면 전에 거부한다", async () => {
+    const fixture = await beginAuthorization();
+    const response = await renderConsent(fixture, { id: 404, login: "mallory" });
+
+    expect(response.status).toBe(403);
+  });
+
+  it("지원하지 않는 추가 scope는 GitHub 인증 전에 거부한다", async () => {
+    const redirectUri = "https://client.example/oauth/callback";
+    const clientId = await registerOAuthClient(redirectUri);
+    const url = await authorizationUrl(
+      clientId,
+      redirectUri,
+      "proofops-test-verifier-abcdefghijklmnopqrstuvwxyz123456",
+      "mcp admin",
+    );
+
+    const response = await SELF.fetch(url);
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toContain("invalid_scope");
+  });
+
+  it.each([
+    ["actorGithubUserId", "999"],
+    ["clientId", "other-client"],
+    ["redirectUri", "https://attacker.example/callback"],
+    ["scopes", "mcp admin"],
+  ] as const)("동의 토큰과 폼의 %s binding이 다르면 거부한다", async (field, value) => {
+    const fixture = await beginAuthorization();
+    const consent = await renderConsent(fixture);
+    const form = parseConsentForm(await consent.text());
+
+    const response = await submitConsent(form, "approve", { [field]: value });
+
+    expect(response.status).toBe(403);
+  });
+
+  it("등록되지 않은 client는 GitHub 인증 전에 거부한다", async () => {
+    const url = await authorizationUrl(
+      "unknown-client",
+      "https://client.example/oauth/callback",
+      "proofops-test-verifier-abcdefghijklmnopqrstuvwxyz123456",
+      "mcp",
+    );
+
+    const response = await SELF.fetch(url);
+
+    expect(response.status).toBe(400);
+  });
+
+  it("등록되지 않은 redirect URI는 GitHub 인증 전에 거부한다", async () => {
+    const registeredRedirect = "https://client.example/oauth/callback";
+    const clientId = await registerOAuthClient(registeredRedirect);
+    const url = await authorizationUrl(
+      clientId,
+      "https://attacker.example/callback",
+      "proofops-test-verifier-abcdefghijklmnopqrstuvwxyz123456",
+      "mcp",
+    );
+
+    const response = await SELF.fetch(url);
+
+    expect(response.status).toBe(400);
+  });
+
+  it("만료된 동의 토큰을 거부한다", async () => {
+    const fixture = await beginAuthorization();
+    const consent = await renderConsent(fixture);
+    const form = parseConsentForm(await consent.text());
+    await env.DB
+      .prepare("UPDATE oauth_ephemeral_states SET expires_at = 0 WHERE kind = 'consent'")
+      .run();
+
+    const response = await submitConsent(form, "approve");
+
+    expect(response.status).toBe(403);
+    await expect(
+      env.DB
+        .prepare("SELECT COUNT(*) AS count FROM oauth_ephemeral_states WHERE kind = 'consent'")
+        .first(),
+    ).resolves.toEqual({ count: 0 });
+  });
+
+  it("동의 토큰은 승인 뒤 재사용할 수 없다", async () => {
+    const fixture = await beginAuthorization();
+    const consent = await renderConsent(fixture);
+    const form = parseConsentForm(await consent.text());
+
+    expect((await submitConsent(form, "approve")).status).toBe(302);
+    expect((await submitConsent(form, "approve")).status).toBe(403);
+  });
+
+  it("동시에 같은 동의 토큰을 소비해도 하나만 승인한다", async () => {
+    const fixture = await beginAuthorization();
+    const consent = await renderConsent(fixture);
+    const form = parseConsentForm(await consent.text());
+
+    const responses = await Promise.all([
+      submitConsent(form, "approve"),
+      submitConsent(form, "approve"),
+    ]);
+
+    expect(responses.map(({ status }) => status).sort()).toEqual([302, 403]);
+  });
+
+  it("거절하면 downstream token 발급 없이 access_denied로 돌아간다", async () => {
+    const fixture = await beginAuthorization();
+    const consent = await renderConsent(fixture);
+    const form = parseConsentForm(await consent.text());
+
+    const response = await submitConsent(form, "deny");
+
+    expect(response.status).toBe(302);
+    const redirect = new URL(requiredHeader(response, "location"));
+    expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.has("code")).toBe(false);
+  });
+
+  it("승인된 사용자는 동의 뒤 MCP를 초기화할 수 있다", async () => {
+    const accessToken = await approvedAccessToken();
+
+    await expect(initializeMcp(accessToken)).resolves.toEqual(expect.any(String));
+  });
+
+  it("GitHub access token을 OAUTH_KV에 저장하지 않는다", async () => {
+    const downstreamAccessToken = await approvedAccessToken();
+    const keys = await env.OAUTH_KV.list();
+    const values = await Promise.all(keys.keys.map(({ name }) => env.OAUTH_KV.get(name)));
+    const d1Values = await env.DB
+      .prepare("SELECT payload_json FROM oauth_ephemeral_states")
+      .all<{ payload_json: string }>();
+
+    expect(values.join("\n")).not.toContain("github-access-token");
+    expect(values.join("\n")).not.toContain(downstreamAccessToken);
+    expect(d1Values.results.map(({ payload_json }) => payload_json).join("\n")).not.toContain(
+      "github-access-token",
+    );
+  });
+});
+
 describe("POST /mcp", () => {
+  it("Bearer access token이 없으면 MCP 초기화를 거부한다", async () => {
+    const response = await postMcp({
+      jsonrpc: "2.0",
+      id: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "proofops-test", version: "1.0.0" },
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain("Bearer");
+  });
+
   it("초기화 후 정확히 일곱 MCP 도구를 공개한다", async () => {
     const sessionId = await initializeMcp();
 
@@ -220,6 +608,9 @@ describe("POST /mcp", () => {
         },
       });
     }
+    await expect(
+      env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first(),
+    ).resolves.toEqual({ count: 0 });
   });
 
   it("record_progress 결과의 JSON 텍스트와 structuredContent를 일치시킨다", async () => {
@@ -272,6 +663,12 @@ describe("POST /mcp", () => {
       evidenceUrl: "https://example.com/build/1",
     });
     expect(JSON.parse(toolResult.content[0].text)).toEqual(toolResult.structuredContent);
+    await expect(
+      env.DB
+        .prepare("SELECT actor_github_user_id FROM progress_notes WHERE task_id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({ actor_github_user_id: 101 });
   });
 
   it("JSON-RPC 사건 조사 호출은 Notion 이슈를 생성하지 않는다", async () => {
@@ -323,3 +720,17 @@ describe("POST /mcp", () => {
     }
   });
 });
+
+async function webhookSignature(body: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return `sha256=${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}

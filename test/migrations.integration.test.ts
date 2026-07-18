@@ -4,11 +4,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import initialMigration from "../migrations/0001_initial.sql?raw";
 import linkedAtMigration from "../migrations/0002_pull_request_linked_at.sql?raw";
 import verificationRequestsMigration from "../migrations/0003_verification_requests.sql?raw";
+import actorAuditMigration from "../migrations/0004_actor_audit.sql?raw";
 
 const migrationFiles = [
   initialMigration,
   linkedAtMigration,
   verificationRequestsMigration,
+  actorAuditMigration,
 ];
 
 async function resetDatabase(): Promise<void> {
@@ -17,6 +19,8 @@ async function resetDatabase(): Promise<void> {
     DROP TABLE IF EXISTS webhook_deliveries;
     DROP TABLE IF EXISTS verification_runs;
     DROP TABLE IF EXISTS verification_requests;
+    DROP TABLE IF EXISTS oauth_ephemeral_states;
+    DROP TABLE IF EXISTS audit_events;
     DROP TABLE IF EXISTS pull_requests;
     DROP TABLE IF EXISTS tasks;
   `);
@@ -63,5 +67,28 @@ describe("D1 마이그레이션 체인", () => {
       )
       .first<{ name: string }>();
     expect(requestTable).toEqual({ name: "verification_requests" });
+
+    const progressColumns = await env.DB
+      .prepare("PRAGMA table_info(progress_notes)")
+      .all<{ name: string }>();
+    expect(
+      progressColumns.results.filter(
+        (column) => column.name === "actor_github_user_id",
+      ),
+    ).toHaveLength(1);
+
+    const oauthStateTable = await env.DB
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'oauth_ephemeral_states'",
+      )
+      .first<{ name: string }>();
+    expect(oauthStateTable).toEqual({ name: "oauth_ephemeral_states" });
+
+    const auditTable = await env.DB
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+      )
+      .first<{ name: string }>();
+    expect(auditTable).toEqual({ name: "audit_events" });
   });
 });
