@@ -6,6 +6,9 @@ export interface Env {
   NOTION_TOKEN: string;
   NOTION_ISSUE_DATABASE_ID: string;
   NOTION_STATUS_PROPERTY: string;
+  GITHUB_APP_ID: string;
+  GITHUB_APP_PRIVATE_KEY: string;
+  GITHUB_WEBHOOK_SECRET: string;
 }
 
 declare global {
@@ -16,6 +19,9 @@ declare global {
       NOTION_TOKEN: string;
       NOTION_ISSUE_DATABASE_ID: string;
       NOTION_STATUS_PROPERTY: string;
+      GITHUB_APP_ID: string;
+      GITHUB_APP_PRIVATE_KEY: string;
+      GITHUB_WEBHOOK_SECRET: string;
     }
   }
 }

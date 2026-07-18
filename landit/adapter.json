@@ -1,0 +1,4 @@
+{
+  "product": "landit",
+  "allowedRepositories": ["landit-be", "landit-ai", "landit-iac", "landit-fe"]
+}

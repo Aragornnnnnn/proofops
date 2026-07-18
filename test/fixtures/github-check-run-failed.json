@@ -1,0 +1,11 @@
+{
+  "action": "completed",
+  "check_run": {
+    "status": "completed",
+    "conclusion": "failure",
+    "head_sha": "payload-check-sha",
+    "pull_requests": [{ "number": 42 }]
+  },
+  "repository": { "full_name": "landit/landit-be" },
+  "installation": { "id": 1001 }
+}

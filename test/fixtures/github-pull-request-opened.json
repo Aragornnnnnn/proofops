@@ -1,0 +1,12 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "html_url": "https://github.com/landit/landit-be/pull/42",
+    "state": "open",
+    "merged": false,
+    "head": { "sha": "payload-open-sha" }
+  },
+  "repository": { "full_name": "landit/landit-be" },
+  "installation": { "id": 1001 }
+}

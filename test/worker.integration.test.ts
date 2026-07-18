@@ -92,7 +92,7 @@ describe("GET /health", () => {
 });
 
 describe("POST /mcp", () => {
-  it("초기화 후 정확히 세 MCP 도구를 공개한다", async () => {
+  it("초기화 후 정확히 네 MCP 도구를 공개한다", async () => {
     const sessionId = await initializeMcp();
 
     const toolsResponse = await postMcp(
@@ -108,15 +108,16 @@ describe("POST /mcp", () => {
       result: {
         tools: [
           { name: "start_task" },
+          { name: "link_pull_request" },
           { name: "get_task_status" },
           { name: "record_progress" },
         ],
       },
     });
-    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(3);
+    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(4);
   });
 
-  it("세 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
+  it("네 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
     const sessionId = await initializeMcp();
     const calls = [
       [
@@ -124,6 +125,15 @@ describe("POST /mcp", () => {
         "start_task",
         { notionPageIdOrUrl: "11111111-1111-1111-1111-111111111111" },
         "NOTION_READ_FAILED",
+      ],
+      [
+        "link",
+        "link_pull_request",
+        {
+          taskId: "missing-task",
+          pullRequestUrl: "https://github.com/attacker/other/pull/1",
+        },
+        "GITHUB_REPOSITORY_NOT_ALLOWED",
       ],
       ["status", "get_task_status", { taskId: "missing-task" }, "TASK_NOT_FOUND"],
       [

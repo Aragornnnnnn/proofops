@@ -1,0 +1,11 @@
+{
+  "action": "submitted",
+  "review": { "state": "changes_requested" },
+  "pull_request": {
+    "number": 42,
+    "html_url": "https://github.com/landit/landit-be/pull/42",
+    "head": { "sha": "payload-review-sha" }
+  },
+  "repository": { "full_name": "landit/landit-be" },
+  "installation": { "id": 1001 }
+}
