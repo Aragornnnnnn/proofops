@@ -10,6 +10,11 @@ export interface NotionPagesApi {
     page_id: string;
     properties: Record<string, { status: { name: string } }>;
   }): Promise<unknown>;
+  create(args: {
+    parent: { database_id: string };
+    properties: Record<string, unknown>;
+    children: Array<Record<string, unknown>>;
+  }): Promise<unknown>;
 }
 
 export interface NotionClientConfig {
@@ -49,8 +54,31 @@ export class NotionClient implements NotionPort {
     }
   }
 
-  async createIssue(_input: CreateIssueInput): Promise<NotionIssue> {
-    throw new Error("NOTION_CREATE_NOT_AVAILABLE");
+  async createIssue(input: CreateIssueInput): Promise<NotionIssue> {
+    try {
+      const page = await this.pages.create({
+        parent: { database_id: this.config.databaseId },
+        properties: {
+          title: {
+            title: [{ type: "text", text: { content: input.title } }],
+          },
+        },
+        children: [
+          {
+            object: "block",
+            type: "paragraph",
+            paragraph: {
+              rich_text: [{ type: "text", text: { content: formatIssueBody(input) } }],
+            },
+          },
+        ],
+      });
+      return mapNotionPage(page as NotionPage, {
+        statusProperty: this.config.statusProperty,
+      });
+    } catch {
+      throw new Error("NOTION_CREATE_FAILED");
+    }
   }
 }
 
@@ -61,6 +89,8 @@ export function createNotionClient(env: Pick<Env, "NOTION_TOKEN" | "NOTION_ISSUE
       retrieve: (args) => client.pages.retrieve(args),
       update: (args) =>
         client.pages.update(args as Parameters<typeof client.pages.update>[0]),
+      create: (args) =>
+        client.pages.create(args as Parameters<typeof client.pages.create>[0]),
     },
     {
       token: env.NOTION_TOKEN,
@@ -68,6 +98,25 @@ export function createNotionClient(env: Pick<Env, "NOTION_TOKEN" | "NOTION_ISSUE
       statusProperty: env.NOTION_STATUS_PROPERTY,
     },
   );
+}
+
+function formatIssueBody(input: CreateIssueInput): string {
+  return [
+    "영향",
+    input.impact,
+    "",
+    "근거 링크",
+    ...input.evidence.map((link) => `- ${link.label}: ${link.url}`),
+    "",
+    "원인 또는 가설",
+    input.causeOrHypothesis,
+    "",
+    "범위",
+    ...input.scope.map((item) => `- ${item}`),
+    "",
+    "완료 조건",
+    ...input.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+  ].join("\n");
 }
 
 export function normalizePageId(pageIdOrUrl: string): string {

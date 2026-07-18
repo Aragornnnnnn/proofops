@@ -7,11 +7,18 @@ import type { Env } from "../env";
 import { createGitHubClient, type GitHubPort } from "../github/app-client";
 import { linkPullRequest, reconcileTask } from "../github/webhook";
 import { createNotionClient } from "../notion/client";
+import type { CreateIssueInput, NotionIssue, NotionPort } from "../notion/service";
+import { createSentryClient, type SentryPort } from "../sentry/client";
+import type { IncidentEvidence } from "../sentry/mapper";
 import type { TaskContext } from "../tasks/repository";
 import { D1TaskRepository } from "../tasks/repository";
 import { TaskService } from "../tasks/service";
 import {
   getTaskStatusInputSchema,
+  createNotionIssueInputSchema,
+  incidentEvidenceSchema,
+  investigateIncidentInputSchema,
+  notionIssueSchema,
   progressNoteSchema,
   recordProgressInputSchema,
   requestVerificationInputSchema,
@@ -48,12 +55,24 @@ export interface ProofOpsTools {
     environment: "develop" | "prod";
     commitSha: string;
   }): Promise<{ requestId: string; workflowRunUrl: string }>;
+  investigateIncident(input: {
+    sentryIssueUrlOrId: string;
+  }): Promise<IncidentEvidence>;
+  createNotionIssue(input: CreateIssueInput): Promise<NotionIssue>;
 }
 
-export function createProofOpsTools(env: Env): ProofOpsTools {
+export function createProofOpsTools(
+  env: Env,
+  dependencies?: {
+    github?: GitHubPort;
+    notion?: NotionPort;
+    sentry?: SentryPort;
+  },
+): ProofOpsTools {
   const tasks = new D1TaskRepository(env.DB);
-  const notion = createNotionClient(env);
-  const github = createGitHubClient(env);
+  const notion = dependencies?.notion ?? createNotionClient(env);
+  const github = dependencies?.github ?? createGitHubClient(env);
+  const sentry = dependencies?.sentry ?? createSentryClient(env);
   const taskService = new TaskService(tasks, notion, (taskId) =>
     reconcileTask({ db: env.DB, github, notion }, taskId),
   );
@@ -94,6 +113,9 @@ export function createProofOpsTools(env: Env): ProofOpsTools {
       await tasks.getContext(input.taskId);
       return requestVerification(input, { db: env.DB, github });
     },
+    investigateIncident: ({ sentryIssueUrlOrId }) =>
+      sentry.investigateIncident(sentryIssueUrlOrId),
+    createNotionIssue: (input) => notion.createIssue(input),
   };
 }
 
@@ -249,6 +271,35 @@ export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): 
         : inputInvalidResult();
     },
   );
+  server.registerTool(
+    "investigate_incident",
+    {
+      description:
+        "지정한 Sentry 이슈의 최소 근거를 읽기 전용으로 조회한다. 이 도구는 Notion 이슈를 만들지 않는다.",
+      inputSchema: mcpInvestigateIncidentInputSchema,
+      outputSchema: incidentEvidenceSchema,
+    },
+    async (input) => {
+      const parsed = investigateIncidentInputSchema.safeParse(input);
+      return parsed.success
+        ? toToolResult(() => tools.investigateIncident(parsed.data))
+        : inputInvalidResult();
+    },
+  );
+  server.registerTool(
+    "create_notion_issue",
+    {
+      description: "명시된 입력으로만 Notion 이슈를 생성한다.",
+      inputSchema: mcpCreateNotionIssueInputSchema,
+      outputSchema: notionIssueSchema,
+    },
+    async (input) => {
+      const parsed = createNotionIssueInputSchema.safeParse(input);
+      return parsed.success
+        ? toToolResult(() => tools.createNotionIssue(parsed.data))
+        : inputInvalidResult();
+    },
+  );
 }
 
 const mcpStartTaskInputSchema = z.object({
@@ -283,6 +334,21 @@ const mcpRequestVerificationInputSchema = z.object({
   commitSha: z.string().catch(""),
 });
 
+const mcpInvestigateIncidentInputSchema = z.object({
+  sentryIssueUrlOrId: z.string().catch(""),
+});
+
+const mcpCreateNotionIssueInputSchema = z.object({
+  title: z.string().catch(""),
+  impact: z.string().catch(""),
+  evidence: z
+    .array(z.object({ label: z.string().catch(""), url: z.string().catch("") }))
+    .catch([]),
+  causeOrHypothesis: z.string().catch(""),
+  scope: z.array(z.string().catch("")).catch([]),
+  acceptanceCriteria: z.array(z.string().catch("")).catch([]),
+});
+
 async function toToolResult<T>(action: () => Promise<T>): Promise<CallToolResult> {
   try {
     const structuredContent = await action();
@@ -310,7 +376,13 @@ function toSafeMcpErrorCode(error: unknown):
   | "GITHUB_READ_FAILED"
   | "GITHUB_REPOSITORY_NOT_ALLOWED"
   | "TASK_NOT_FOUND"
-  | "INPUT_INVALID" {
+  | "INPUT_INVALID"
+  | "NOTION_CREATE_FAILED"
+  | "SENTRY_AUTH_FAILED"
+  | "SENTRY_FORBIDDEN"
+  | "SENTRY_NOT_FOUND"
+  | "SENTRY_RATE_LIMITED"
+  | "SENTRY_READ_FAILED" {
   const message =
     typeof error === "object" && error !== null && "message" in error
       ? error.message
@@ -322,5 +394,11 @@ function toSafeMcpErrorCode(error: unknown):
     return "GITHUB_REPOSITORY_NOT_ALLOWED";
   }
   if (message === "TASK_NOT_FOUND") return "TASK_NOT_FOUND";
+  if (message === "NOTION_CREATE_FAILED") return "NOTION_CREATE_FAILED";
+  if (message === "SENTRY_AUTH_FAILED") return "SENTRY_AUTH_FAILED";
+  if (message === "SENTRY_FORBIDDEN") return "SENTRY_FORBIDDEN";
+  if (message === "SENTRY_NOT_FOUND") return "SENTRY_NOT_FOUND";
+  if (message === "SENTRY_RATE_LIMITED") return "SENTRY_RATE_LIMITED";
+  if (message === "SENTRY_READ_FAILED") return "SENTRY_READ_FAILED";
   return "INPUT_INVALID";
 }

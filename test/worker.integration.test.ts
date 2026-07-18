@@ -1,6 +1,8 @@
 // Worker의 기본 HTTP 동작을 검증하는 통합 테스트
 import { env, SELF } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import { createProofOpsTools } from "../src/mcp/tools";
 
 const mcpHeaders = {
   accept: "application/json, text/event-stream",
@@ -107,7 +109,7 @@ describe("GET /health", () => {
 });
 
 describe("POST /mcp", () => {
-  it("초기화 후 정확히 다섯 MCP 도구를 공개한다", async () => {
+  it("초기화 후 정확히 일곱 MCP 도구를 공개한다", async () => {
     const sessionId = await initializeMcp();
 
     const toolsResponse = await postMcp(
@@ -127,13 +129,15 @@ describe("POST /mcp", () => {
           { name: "get_task_status" },
           { name: "record_progress" },
           { name: "request_verification" },
+          { name: "investigate_incident" },
+          { name: "create_notion_issue" },
         ],
       },
     });
-    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(5);
+    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(7);
   });
 
-  it("다섯 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
+  it("일곱 도구가 안정된 오류 코드로 실패를 반환한다", async () => {
     const sessionId = await initializeMcp();
     const calls = [
       [
@@ -172,6 +176,25 @@ describe("POST /mcp", () => {
           repository: "Aragornnnnnn/landit-be",
           environment: "stage",
           commitSha: "not-a-sha",
+        },
+        "INPUT_INVALID",
+      ],
+      [
+        "invalid-incident",
+        "investigate_incident",
+        { sentryIssueUrlOrId: "" },
+        "INPUT_INVALID",
+      ],
+      [
+        "invalid-notion-issue",
+        "create_notion_issue",
+        {
+          title: "",
+          impact: "",
+          evidence: [],
+          causeOrHypothesis: "",
+          scope: [],
+          acceptanceCriteria: [],
         },
         "INPUT_INVALID",
       ],
@@ -250,5 +273,37 @@ describe("POST /mcp", () => {
       evidenceUrl: "https://example.com/build/1",
     });
     expect(JSON.parse(toolResult.content[0].text)).toEqual(toolResult.structuredContent);
+  });
+
+  it("사건 조사 호출은 Notion 이슈를 생성하지 않는다", async () => {
+    const createIssue = vi.fn();
+    const tools = createProofOpsTools(env as Env, {
+      sentry: {
+        investigateIncident: vi.fn().mockResolvedValue({
+          issueId: "12345",
+          title: "TypeError",
+          culprit: null,
+          firstSeen: null,
+          lastSeen: null,
+          count: 1,
+          affectedUsers: 1,
+          release: null,
+          topStackFrames: [],
+          evidence: [{ label: "Sentry issue", url: "https://sentry.io/issues/12345/" }],
+          observationLimit:
+            "Sentry issue metadata and the latest event were read; no root-cause conclusion was made.",
+        }),
+      },
+      notion: {
+        getIssue: vi.fn(),
+        updateTechnicalStatus: vi.fn(),
+        createIssue,
+      },
+    });
+
+    await expect(
+      tools.investigateIncident({ sentryIssueUrlOrId: "12345" }),
+    ).resolves.toMatchObject({ issueId: "12345" });
+    expect(createIssue).not.toHaveBeenCalled();
   });
 });

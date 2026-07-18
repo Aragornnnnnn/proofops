@@ -13,9 +13,16 @@ export interface NotionIssue {
 
 export interface CreateIssueInput {
   title: string;
-  description: string;
+  impact: string;
+  evidence: EvidenceLink[];
+  causeOrHypothesis: string;
+  scope: string[];
   acceptanceCriteria: string[];
-  repositories: string[];
+}
+
+export interface EvidenceLink {
+  label: string;
+  url: string;
 }
 
 export interface NotionPort {

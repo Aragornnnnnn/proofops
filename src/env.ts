@@ -9,6 +9,9 @@ export interface Env {
   GITHUB_APP_ID: string;
   GITHUB_APP_PRIVATE_KEY: string;
   GITHUB_WEBHOOK_SECRET: string;
+  SENTRY_TOKEN: string;
+  SENTRY_ORG_SLUG: string;
+  SENTRY_PROJECT_SLUG: string;
 }
 
 declare global {
@@ -22,6 +25,9 @@ declare global {
       GITHUB_APP_ID: string;
       GITHUB_APP_PRIVATE_KEY: string;
       GITHUB_WEBHOOK_SECRET: string;
+      SENTRY_TOKEN: string;
+      SENTRY_ORG_SLUG: string;
+      SENTRY_PROJECT_SLUG: string;
     }
   }
 }

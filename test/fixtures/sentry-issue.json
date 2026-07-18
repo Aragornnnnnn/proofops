@@ -1,0 +1,39 @@
+{
+  "id": "12345",
+  "title": "TypeError: Cannot read properties of undefined",
+  "culprit": "GET /api/v1/scenarios",
+  "firstSeen": "2026-07-17T00:00:00Z",
+  "lastSeen": "2026-07-18T00:00:00Z",
+  "count": "42",
+  "userCount": 7,
+  "permalink": "https://sentry.io/organizations/landit/issues/12345/",
+  "project": { "slug": "proofops", "organization": { "slug": "landit" } },
+  "lastRelease": { "version": "proofops@1.2.3" },
+  "latestEvent": {
+    "eventID": "abc123",
+    "webUrl": "https://sentry.io/organizations/landit/issues/12345/events/abc123/",
+    "user": { "email": "user@example.com" },
+    "request": {
+      "headers": [["Authorization", "Bearer event-secret"], ["Cookie", "session=private"]],
+      "data": "requestBodySecret"
+    },
+    "entries": [
+      {
+        "type": "exception",
+        "data": {
+          "values": [
+            {
+              "stacktrace": {
+                "frames": [
+                  { "filename": "src/secret.ts", "function": "hidden", "lineno": 1, "vars": { "local": "localSecret" } },
+                  { "filename": "src/routes/scenarios.ts", "function": "getScenarios", "lineno": 42, "colno": 7, "vars": { "token": "localSecret" } },
+                  { "filename": "src/services/scenario.ts", "function": "list", "lineno": 18, "colno": 3 }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

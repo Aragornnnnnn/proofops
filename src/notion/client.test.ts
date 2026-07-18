@@ -15,6 +15,13 @@ function createPages() {
       },
     }),
     update: vi.fn().mockResolvedValue({}),
+    create: vi.fn().mockResolvedValue({
+      id: pageId,
+      url: "https://www.notion.so/123456781234123412341234567890ab",
+      properties: {
+        Name: { type: "title", title: [{ plain_text: "새 이슈" }] },
+      },
+    }),
   };
 }
 
@@ -69,7 +76,7 @@ describe("NotionClient", () => {
     });
   });
 
-  it("아직 구현되지 않은 이슈 생성은 안전한 오류로 거부한다", async () => {
+  it("명시된 이슈 입력을 고정된 본문 순서로 생성한다", async () => {
     const pages = createPages();
     const client = new NotionClient(pages, {
       token,
@@ -80,11 +87,37 @@ describe("NotionClient", () => {
     await expect(
       client.createIssue({
         title: "새 이슈",
-        description: "설명",
-        acceptanceCriteria: [],
-        repositories: [],
+        impact: "사용자 목록을 조회할 수 없다.",
+        evidence: [{ label: "Sentry issue", url: "https://sentry.io/issues/12345/" }],
+        causeOrHypothesis: "Null 처리 누락으로 추정한다.",
+        scope: ["API", "Web"],
+        acceptanceCriteria: ["재현 테스트 추가"],
       }),
-    ).rejects.toThrow("NOTION_CREATE_NOT_AVAILABLE");
-    expect(pages.update).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ pageId, title: "새 이슈" });
+    expect(pages.create).toHaveBeenCalledWith({
+      parent: { database_id: "database-id" },
+      properties: {
+        title: {
+          title: [{ type: "text", text: { content: "새 이슈" } }],
+        },
+      },
+      children: [
+        {
+          object: "block",
+          type: "paragraph",
+          paragraph: {
+            rich_text: [
+              {
+                type: "text",
+                text: {
+                  content:
+                    "영향\n사용자 목록을 조회할 수 없다.\n\n근거 링크\n- Sentry issue: https://sentry.io/issues/12345/\n\n원인 또는 가설\nNull 처리 누락으로 추정한다.\n\n범위\n- API\n- Web\n\n완료 조건\n- 재현 테스트 추가",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
   });
 });

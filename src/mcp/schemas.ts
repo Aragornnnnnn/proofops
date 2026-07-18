@@ -40,6 +40,27 @@ export const requestVerificationInputSchema = z.object({
   commitSha: z.string().regex(/^[0-9a-f]{40}$/i),
 });
 
+const evidenceLinkSchema = z.object({
+  label: z.string().trim().min(1).max(200),
+  url: z.url().refine((value) => {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  }, "evidence URL must use http or https"),
+});
+
+export const investigateIncidentInputSchema = z.object({
+  sentryIssueUrlOrId: z.string().trim().min(1).max(2_000),
+});
+
+export const createNotionIssueInputSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  impact: z.string().trim().min(1).max(4_000),
+  evidence: z.array(evidenceLinkSchema).min(1).max(20),
+  causeOrHypothesis: z.string().trim().min(1).max(4_000),
+  scope: z.array(z.string().trim().min(1).max(500)).min(1).max(50),
+  acceptanceCriteria: z.array(z.string().trim().min(1).max(1_000)).min(1).max(50),
+});
+
 export const taskContextSchema = z.object({
   id: z.string(),
   notionPageId: z.string(),
@@ -63,4 +84,35 @@ export const progressNoteSchema = z.object({
 export const verificationDispatchSchema = z.object({
   requestId: z.string().uuid(),
   workflowRunUrl: z.string().url(),
+});
+
+export const incidentEvidenceSchema = z.object({
+  issueId: z.string(),
+  title: z.string(),
+  culprit: z.string().nullable(),
+  firstSeen: z.string().nullable(),
+  lastSeen: z.string().nullable(),
+  count: z.number().nullable(),
+  affectedUsers: z.number().nullable(),
+  release: z.string().nullable(),
+  topStackFrames: z.array(
+    z.object({
+      filename: z.string().nullable(),
+      function: z.string().nullable(),
+      line: z.number().nullable(),
+      column: z.number().nullable(),
+    }),
+  ),
+  evidence: z.array(evidenceLinkSchema),
+  observationLimit: z.string(),
+});
+
+export const notionIssueSchema = z.object({
+  pageId: z.string(),
+  url: z.string().url(),
+  title: z.string(),
+  description: z.string(),
+  acceptanceCriteria: z.array(z.string()),
+  repositories: z.array(z.string()),
+  currentTechnicalStatus: z.string().nullable(),
 });
