@@ -57,8 +57,8 @@ interface RawStackFrame {
 
 export function mapSentryIssue(rawIssue: unknown): IncidentEvidence {
   const issue = isSentryIssue(rawIssue) ? rawIssue : {};
-  const issueUrl = sanitizeEvidenceText(issue.permalink);
-  const eventUrl = sanitizeEvidenceText(issue.latestEvent?.webUrl);
+  const issueUrl = sanitizeSentryEvidenceUrl(issue.permalink);
+  const eventUrl = sanitizeSentryEvidenceUrl(issue.latestEvent?.webUrl);
   return {
     issueId: sanitizeEvidenceText(issue.id),
     title: sanitizeEvidenceText(issue.title),
@@ -129,6 +129,23 @@ export function sanitizeEvidenceText(value: unknown): string {
     .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[REDACTED]")
     .trim()
     .slice(0, 500);
+}
+
+export function sanitizeSentryEvidenceUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "sentry.io" || url.port) {
+      return null;
+    }
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 function nullableEvidenceText(value: unknown): string | null {

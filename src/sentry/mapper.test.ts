@@ -71,6 +71,49 @@ describe("mapSentryIssue", () => {
       mapSentryIssue({ ...sensitiveTextFixture, title: "a ".repeat(300) }).title,
     ).toHaveLength(500);
   });
+
+  it("Sentry 증거 URL에서 credential을 제거하고 허용된 canonical 링크만 반환한다", () => {
+    const withCredentials = mapSentryIssue({
+      ...fixture,
+      permalink:
+        "https://user:pw@sentry.io/organizations/landit/issues/12345/?token=url-query-secret#password=url-fragment-secret",
+      latestEvent: {
+        ...fixture.latestEvent,
+        webUrl:
+          "https://event-user:event-pw@sentry.io/organizations/landit/issues/12345/events/abc123/?api_key=event-query-secret#secret=event-fragment-secret",
+      },
+    });
+
+    expect(withCredentials.evidence).toEqual([
+      { label: "Sentry issue", url: "https://sentry.io/organizations/landit/issues/12345/" },
+      {
+        label: "Latest Sentry event",
+        url: "https://sentry.io/organizations/landit/issues/12345/events/abc123/",
+      },
+    ]);
+    const serialized = JSON.stringify(withCredentials);
+    for (const forbidden of [
+      "user:pw",
+      "event-user:event-pw",
+      "url-query-secret",
+      "url-fragment-secret",
+      "event-query-secret",
+      "event-fragment-secret",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+
+    expect(
+      mapSentryIssue({
+        ...fixture,
+        permalink: "https://sentry.io.evil.example/organizations/landit/issues/12345/",
+        latestEvent: {
+          ...fixture.latestEvent,
+          webUrl: "http://sentry.io/organizations/landit/issues/12345/events/abc123/",
+        },
+      }).evidence,
+    ).toEqual([]);
+  });
 });
 
 describe("SentryClient", () => {
