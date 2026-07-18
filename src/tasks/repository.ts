@@ -1,5 +1,25 @@
 // D1에 작업과 외부 증거 연결 메타데이터를 저장한다
 import type { TechnicalStatus } from "../domain/types";
+import type { NotionIssue } from "../notion/service";
+
+export interface TaskRecord {
+  id: string;
+  notionPageId: string;
+  notionUrl: string;
+  title: string;
+  technicalStatus: TechnicalStatus;
+  expectedRepositories: string[];
+  lastSyncError: string | null;
+}
+
+export type TaskContext = TaskRecord;
+
+export interface TaskRepository {
+  upsertFromNotion(issue: NotionIssue): Promise<TaskRecord>;
+  clearSyncError(taskId: string): Promise<void>;
+  recordSyncError(taskId: string, message: string): Promise<void>;
+  getContext(taskId: string): Promise<TaskContext>;
+}
 
 export interface CreateTaskInput {
   id: string;
@@ -98,4 +118,89 @@ export async function recordWebhookDelivery(
     .run();
 
   return result.meta.changes === 1;
+}
+
+export class D1TaskRepository implements TaskRepository {
+  constructor(
+    private readonly db: D1Database,
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly newId: () => string = () => crypto.randomUUID(),
+  ) {}
+
+  async upsertFromNotion(issue: NotionIssue): Promise<TaskRecord> {
+    const existing = await this.findByNotionPageId(issue.pageId);
+    if (existing) return existing;
+
+    const timestamp = this.now();
+    const task: TaskRecord = {
+      id: this.newId(),
+      notionPageId: issue.pageId,
+      notionUrl: issue.url,
+      title: issue.title,
+      technicalStatus: "In Progress",
+      expectedRepositories: issue.repositories,
+      lastSyncError: null,
+    };
+    await createTask(this.db, {
+      ...task,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    return task;
+  }
+
+  async clearSyncError(taskId: string): Promise<void> {
+    await this.db
+      .prepare("UPDATE tasks SET last_sync_error = NULL, updated_at = ? WHERE id = ?")
+      .bind(this.now(), taskId)
+      .run();
+  }
+
+  async recordSyncError(taskId: string, message: string): Promise<void> {
+    await this.db
+      .prepare("UPDATE tasks SET last_sync_error = ?, updated_at = ? WHERE id = ?")
+      .bind(message, this.now(), taskId)
+      .run();
+  }
+
+  async getContext(taskId: string): Promise<TaskContext> {
+    const task = await this.db
+      .prepare(`SELECT id, notion_page_id, notion_url, title, technical_status,
+        expected_repositories, last_sync_error FROM tasks WHERE id = ?`)
+      .bind(taskId)
+      .first<TaskRow>();
+    if (!task) throw new Error("TASK_NOT_FOUND");
+    return toTaskRecord(task);
+  }
+
+  private async findByNotionPageId(pageId: string): Promise<TaskRecord | null> {
+    const task = await this.db
+      .prepare(`SELECT id, notion_page_id, notion_url, title, technical_status,
+        expected_repositories, last_sync_error FROM tasks WHERE notion_page_id = ?`)
+      .bind(pageId)
+      .first<TaskRow>();
+    return task ? toTaskRecord(task) : null;
+  }
+}
+
+interface TaskRow {
+  id: string;
+  notion_page_id: string;
+  notion_url: string;
+  title: string;
+  technical_status: TechnicalStatus;
+  expected_repositories: string;
+  last_sync_error: string | null;
+}
+
+function toTaskRecord(row: TaskRow): TaskRecord {
+  return {
+    id: row.id,
+    notionPageId: row.notion_page_id,
+    notionUrl: row.notion_url,
+    title: row.title,
+    technicalStatus: row.technical_status,
+    expectedRepositories: JSON.parse(row.expected_repositories) as string[],
+    lastSyncError: row.last_sync_error,
+  };
 }

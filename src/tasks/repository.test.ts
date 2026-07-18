@@ -2,6 +2,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  D1TaskRepository,
   createTask,
   recordWebhookDelivery,
   upsertPullRequest,
@@ -77,6 +78,25 @@ describe("D1 작업 연결 저장소", () => {
       notion_page_id: "notion-page-1",
       expected_repositories: '["proofops/proofops"]',
     });
+  });
+
+  it("같은 Notion 이슈는 기존 작업을 반환한다", async () => {
+    const repository = new D1TaskRepository(env.DB, () => createdAt, () => "task-1");
+    const issue = {
+      pageId: "notion-page-1",
+      url: "https://notion.so/task-1",
+      title: "상태 계산 구현",
+      description: "상태를 계산한다.",
+      acceptanceCriteria: [],
+      repositories: ["proofops/proofops"],
+      currentTechnicalStatus: null,
+    };
+
+    const first = await repository.upsertFromNotion(issue);
+    const second = await repository.upsertFromNotion({ ...issue, title: "변경된 제목" });
+
+    expect(first).toMatchObject({ id: "task-1", title: "상태 계산 구현" });
+    expect(second).toEqual(first);
   });
 
   it("같은 저장소와 번호의 PR을 재연결한다", async () => {
