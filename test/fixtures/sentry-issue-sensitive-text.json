@@ -1,0 +1,40 @@
+{
+  "id": "54321",
+  "title": "Payment failed for alice@example.com Authorization: Bearer title-secret-token-value-1234567890",
+  "culprit": "POST /pay?api_key=culprit-key-1234567890 Cookie: session=culprit-session-1234567890 key=direct-key-1234567890",
+  "firstSeen": "2026-07-17T00:00:00Z",
+  "lastSeen": "2026-07-18T00:00:00Z",
+  "count": "1",
+  "userCount": 1,
+  "permalink": "https://sentry.io/organizations/landit/issues/54321/",
+  "project": { "slug": "proofops", "organization": { "slug": "landit" } },
+  "latestEvent": {
+    "entries": [
+      {
+        "type": "exception",
+        "data": {
+          "values": [
+            {
+              "stacktrace": {
+                "frames": [
+                  {
+                    "filename": "src/payments.ts?token=frame-token-1234567890#password=frame-password-1234567890",
+                    "function": "charge\u0000 user=bob@example.com bearer frame-bearer-token-1234567890",
+                    "lineno": 22,
+                    "colno": 9
+                  },
+                  {
+                    "filename": "src/config.ts sessionId=frame-session-1234567890",
+                    "function": "loadConfig secret=frame-secret-1234567890 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue123",
+                    "lineno": 8,
+                    "colno": 1
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

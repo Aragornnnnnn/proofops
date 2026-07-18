@@ -1,8 +1,7 @@
 // Worker의 기본 HTTP 동작을 검증하는 통합 테스트
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../src/env";
-import { createProofOpsTools } from "../src/mcp/tools";
+import sentryIssue from "./fixtures/sentry-issue.json";
 
 const mcpHeaders = {
   accept: "application/json, text/event-stream",
@@ -275,35 +274,52 @@ describe("POST /mcp", () => {
     expect(JSON.parse(toolResult.content[0].text)).toEqual(toolResult.structuredContent);
   });
 
-  it("사건 조사 호출은 Notion 이슈를 생성하지 않는다", async () => {
-    const createIssue = vi.fn();
-    const tools = createProofOpsTools(env as Env, {
-      sentry: {
-        investigateIncident: vi.fn().mockResolvedValue({
-          issueId: "12345",
-          title: "TypeError",
-          culprit: null,
-          firstSeen: null,
-          lastSeen: null,
-          count: 1,
-          affectedUsers: 1,
-          release: null,
-          topStackFrames: [],
-          evidence: [{ label: "Sentry issue", url: "https://sentry.io/issues/12345/" }],
-          observationLimit:
-            "Sentry issue metadata and the latest event were read; no root-cause conclusion was made.",
-        }),
-      },
-      notion: {
-        getIssue: vi.fn(),
-        updateTechnicalStatus: vi.fn(),
-        createIssue,
-      },
+  it("JSON-RPC 사건 조사 호출은 Notion 이슈를 생성하지 않는다", async () => {
+    const upstreamFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/projects/landit/proofops/issues/")) {
+        return Response.json([{ id: "12345" }]);
+      }
+      if (url === "https://sentry.io/api/0/issues/12345/") {
+        return Response.json(sentryIssue);
+      }
+      if (url.startsWith("https://api.notion.com/")) {
+        throw new Error("Notion create must not be called during investigation");
+      }
+      throw new Error(`Unexpected upstream request: ${url}`);
     });
+    vi.stubGlobal("fetch", upstreamFetch);
 
-    await expect(
-      tools.investigateIncident({ sentryIssueUrlOrId: "12345" }),
-    ).resolves.toMatchObject({ issueId: "12345" });
-    expect(createIssue).not.toHaveBeenCalled();
+    try {
+      const sessionId = await initializeMcp();
+      const response = await postMcp(
+        {
+          jsonrpc: "2.0",
+          id: "investigate",
+          method: "tools/call",
+          params: {
+            name: "investigate_incident",
+            arguments: { sentryIssueUrlOrId: "12345" },
+          },
+        },
+        sessionId,
+      );
+
+      expect(response.status).toBe(200);
+      await expect(readMcpResponse(response)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: "investigate",
+        result: {
+          structuredContent: { issueId: "12345", title: sentryIssue.title },
+        },
+      });
+      expect(
+        upstreamFetch.mock.calls.filter(([input]) =>
+          String(input).startsWith("https://api.notion.com/"),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

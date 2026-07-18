@@ -1,6 +1,7 @@
 // Sentry 원문에서 안전한 사건 근거만 추출하는 매퍼와 클라이언트를 검증한다
 import { describe, expect, it, vi } from "vitest";
 import fixture from "../../test/fixtures/sentry-issue.json";
+import sensitiveTextFixture from "../../test/fixtures/sentry-issue-sensitive-text.json";
 import { SentryClient } from "./client";
 import { mapSentryIssue } from "./mapper";
 
@@ -40,6 +41,35 @@ describe("mapSentryIssue", () => {
     ]) {
       expect(evidence).not.toContain(forbidden);
     }
+  });
+
+  it("제목, culprit과 스택 문자열의 민감한 텍스트를 일관되게 제거한다", () => {
+    const mapped = mapSentryIssue(sensitiveTextFixture);
+    const evidence = JSON.stringify(mapped);
+
+    for (const forbidden of [
+      "alice@example.com",
+      "bob@example.com",
+      "title-secret-token-value-1234567890",
+      "culprit-key-1234567890",
+      "culprit-session-1234567890",
+      "direct-key-1234567890",
+      "frame-token-1234567890",
+      "frame-password-1234567890",
+      "frame-bearer-token-1234567890",
+      "frame-session-1234567890",
+      "frame-secret-1234567890",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetokenvalue123",
+      "Authorization",
+      "Cookie",
+      "\u0000",
+    ]) {
+      expect(evidence).not.toContain(forbidden);
+    }
+    expect(mapped.topStackFrames[0]?.function).not.toMatch(/[\u0000-\u001F\u007F]/);
+    expect(
+      mapSentryIssue({ ...sensitiveTextFixture, title: "a ".repeat(300) }).title,
+    ).toHaveLength(500);
   });
 });
 

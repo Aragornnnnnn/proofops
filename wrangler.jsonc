@@ -26,6 +26,8 @@
     }
   ],
   "vars": {
-    "ENVIRONMENT": "local"
+    "ENVIRONMENT": "local",
+    "SENTRY_ORG_SLUG": "landit",
+    "SENTRY_PROJECT_SLUG": "proofops"
   }
 }

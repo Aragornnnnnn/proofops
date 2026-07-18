@@ -57,17 +57,17 @@ interface RawStackFrame {
 
 export function mapSentryIssue(rawIssue: unknown): IncidentEvidence {
   const issue = isSentryIssue(rawIssue) ? rawIssue : {};
-  const issueUrl = text(issue.permalink);
-  const eventUrl = text(issue.latestEvent?.webUrl);
+  const issueUrl = sanitizeEvidenceText(issue.permalink);
+  const eventUrl = sanitizeEvidenceText(issue.latestEvent?.webUrl);
   return {
-    issueId: text(issue.id),
-    title: text(issue.title),
-    culprit: nullableText(issue.culprit),
-    firstSeen: nullableText(issue.firstSeen),
-    lastSeen: nullableText(issue.lastSeen),
+    issueId: sanitizeEvidenceText(issue.id),
+    title: sanitizeEvidenceText(issue.title),
+    culprit: nullableEvidenceText(issue.culprit),
+    firstSeen: nullableEvidenceText(issue.firstSeen),
+    lastSeen: nullableEvidenceText(issue.lastSeen),
     count: numberOrNull(issue.count),
     affectedUsers: numberOrNull(issue.userCount),
-    release: nullableText(issue.lastRelease?.version),
+    release: nullableEvidenceText(issue.lastRelease?.version),
     topStackFrames: topStackFrames(issue.latestEvent),
     evidence: [
       ...(issueUrl ? [{ label: "Sentry issue", url: issueUrl }] : []),
@@ -88,11 +88,14 @@ function topStackFrames(event: SentryIssue["latestEvent"]): StackFrame[] {
     ?.data?.values?.flatMap((value) => value.stacktrace?.frames ?? []) ?? [];
 
   return frames
-    .filter((frame) => nullableText(frame.filename) || nullableText(frame.function))
+    .filter(
+      (frame) =>
+        nullableEvidenceText(frame.filename) || nullableEvidenceText(frame.function),
+    )
     .slice(-2)
     .map((frame) => ({
-      filename: nullableText(frame.filename),
-      function: nullableText(frame.function),
+      filename: nullableEvidenceText(frame.filename),
+      function: nullableEvidenceText(frame.function),
       line: numberOrNull(frame.lineno),
       column: numberOrNull(frame.colno),
     }));
@@ -102,8 +105,34 @@ function text(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function nullableText(value: unknown): string | null {
-  const normalized = text(value).trim();
+export function sanitizeEvidenceText(value: unknown): string {
+  return text(value)
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[REDACTED]")
+    .replace(/\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+/gi, "[REDACTED]")
+    .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
+    .replace(/\b(?:cookie|session(?:id)?)\s*[:=]\s*[^\s,;]+/gi, "[REDACTED]")
+    .replace(
+      /\b(?:api[-_]?key|access[-_]?token|access[-_]?key|key|token|secret|password)\s*[:=]\s*[^\s,;#&]+/gi,
+      "[REDACTED]",
+    )
+    .replace(
+      /([?&](?:api[-_]?key|access[-_]?token|access[-_]?key|key|token|secret|password)=)[^&#\s]*/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
+      /(#(?:api[-_]?key|access[-_]?token|access[-_]?key|key|token|secret|password)=)[^&#\s]*/gi,
+      "$1[REDACTED]",
+    )
+    .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED]")
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[REDACTED]")
+    .trim()
+    .slice(0, 500);
+}
+
+function nullableEvidenceText(value: unknown): string | null {
+  const normalized = sanitizeEvidenceText(value);
   return normalized || null;
 }
 
