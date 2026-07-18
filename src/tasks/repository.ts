@@ -86,6 +86,10 @@ export async function upsertPullRequest(
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(repository, pr_number) DO UPDATE SET
         task_id = excluded.task_id,
+        linked_at = CASE
+          WHEN pull_requests.task_id = excluded.task_id THEN pull_requests.linked_at
+          ELSE excluded.linked_at
+        END,
         pr_url = excluded.pr_url,
         state = excluded.state,
         review_state = excluded.review_state,

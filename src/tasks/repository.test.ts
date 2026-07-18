@@ -222,6 +222,72 @@ describe("D1 작업 연결 저장소", () => {
     });
   });
 
+  it("다른 작업으로 PR을 재연결하면 그 시점을 새 링크 시점으로 기록한다", async () => {
+    for (const id of ["task-1", "task-2"]) {
+      await createTask(env.DB, {
+        id,
+        notionPageId: `notion-page-${id}`,
+        notionUrl: `https://notion.so/${id}`,
+        title: "작업 간 PR 재연결",
+        technicalStatus: "In Progress",
+        expectedRepositories: ["landit-be"],
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+    await upsertPullRequest(env.DB, {
+      id: "pr-1",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 42,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/42",
+      state: "open",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "first",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-1-status",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 42,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/42",
+      state: "merged",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "merged",
+      updatedAt: "2026-07-18T00:10:00.000Z",
+    });
+    await expect(
+      env.DB
+        .prepare("SELECT linked_at FROM pull_requests WHERE pr_number = 42")
+        .first(),
+    ).resolves.toEqual({ linked_at: "2026-07-18T00:00:00.000Z" });
+    await upsertPullRequest(env.DB, {
+      id: "pr-1-relinked",
+      taskId: "task-2",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 42,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/42",
+      state: "merged",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "relinked",
+      updatedAt: "2026-07-18T00:20:00.000Z",
+    });
+
+    await expect(
+      env.DB
+        .prepare("SELECT task_id, linked_at, updated_at FROM pull_requests WHERE pr_number = 42")
+        .first(),
+    ).resolves.toEqual({
+      task_id: "task-2",
+      linked_at: "2026-07-18T00:20:00.000Z",
+      updated_at: "2026-07-18T00:20:00.000Z",
+    });
+  });
+
   it("중복 웹훅 전달은 false를 반환한다", async () => {
     await expect(
       recordWebhookDelivery(env.DB, {

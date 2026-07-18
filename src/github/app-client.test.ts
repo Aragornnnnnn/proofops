@@ -171,4 +171,57 @@ describe("GitHubAppClient.getTaskSnapshot", () => {
       }),
     ).not.toBe("Done");
   });
+
+  it("다른 작업으로 재연결된 PR의 새 링크 시점으로 최신 PR을 선택한다", async () => {
+    const database = {
+      prepare: (query: string) => ({
+        bind: (taskId: string) => ({
+          all: async () => ({
+            results:
+              taskId === "task-2"
+                ? query.includes("linked_at DESC")
+                  ? [
+                      {
+                        repository: "Aragornnnnnn/landit-be",
+                        pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+                      },
+                      {
+                        repository: "Aragornnnnnn/landit-be",
+                        pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                      },
+                    ]
+                  : [
+                      {
+                        repository: "Aragornnnnnn/landit-be",
+                        pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                      },
+                      {
+                        repository: "Aragornnnnnn/landit-be",
+                        pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+                      },
+                    ]
+                : [],
+          }),
+          first: async () =>
+            query.includes("expected_repositories")
+              ? { expected_repositories: '["landit-be"]' }
+              : null,
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    vi.spyOn(client, "getPullRequest").mockImplementation(async (url) => ({
+      repository: "Aragornnnnnn/landit-be",
+      number: url.endsWith("/10") ? 10 : 11,
+      url,
+      headSha: "current",
+      state: "open",
+      review: "approved",
+      ci: "passed",
+    }));
+
+    await expect(client.getTaskSnapshot("task-2")).resolves.toMatchObject({
+      pullRequests: [expect.objectContaining({ number: 10 })],
+    });
+  });
 });
