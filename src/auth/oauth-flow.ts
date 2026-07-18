@@ -157,7 +157,7 @@ async function handleConsent(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function exchangeGitHubCode(
+export async function exchangeGitHubCode(
   code: string,
   request: Request,
   env: Env,
@@ -183,7 +183,7 @@ async function exchangeGitHubCode(
   return body.access_token;
 }
 
-async function fetchGitHubProfile(accessToken: string): Promise<GitHubProfile> {
+export async function fetchGitHubProfile(accessToken: string): Promise<GitHubProfile> {
   const response = await fetch("https://api.github.com/user", {
     headers: {
       accept: "application/vnd.github+json",

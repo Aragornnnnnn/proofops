@@ -131,6 +131,37 @@ async function renderConsent(
   }
 }
 
+async function loginToDashboard(
+  profile: { id: number; login: string } = { id: 101, login: "Alice" },
+): Promise<Response> {
+  const login = await SELF.fetch("https://proofops.test/dashboard/login", {
+    redirect: "manual",
+  });
+  expect(login.status).toBe(302);
+  const githubUrl = new URL(requiredHeader(login, "location"));
+  const state = requiredQuery(githubUrl, "state");
+  const previousFetch = globalThis.fetch;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === "https://github.com/login/oauth/access_token") {
+        return Response.json({ access_token: "dashboard-github-token" });
+      }
+      if (url === "https://api.github.com/user") return Response.json(profile);
+      throw new Error(`Unexpected upstream request: ${url}`);
+    }),
+  );
+  try {
+    return await SELF.fetch(
+      `https://proofops.test/oauth/callback?code=dashboard-code&state=${encodeURIComponent(state)}`,
+      { redirect: "manual" },
+    );
+  } finally {
+    vi.stubGlobal("fetch", previousFetch);
+  }
+}
+
 async function approvedAccessToken(
   profile: { id: number; login: string } = { id: 101, login: "Alice" },
   tokenScope?: string,
@@ -245,7 +276,9 @@ beforeEach(async () => {
         title TEXT NOT NULL,
         technical_status TEXT NOT NULL,
         expected_repositories TEXT NOT NULL,
-        last_sync_error TEXT
+        last_sync_error TEXT,
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT ''
       )`),
     env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS progress_notes (
@@ -294,6 +327,14 @@ beforeEach(async () => {
         created_at INTEGER NOT NULL
       )`),
     env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS dashboard_sessions (
+        token_hash TEXT PRIMARY KEY,
+        actor_github_user_id INTEGER NOT NULL,
+        actor_github_login TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )`),
+    env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS pull_requests (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL,
@@ -307,11 +348,27 @@ beforeEach(async () => {
         linked_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS verification_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        workflow_run_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        evidence_url TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        commit_sha TEXT,
+        request_id TEXT,
+        created_at TEXT NOT NULL
+      )`),
     env.DB.prepare("DELETE FROM pull_requests"),
+    env.DB.prepare("DELETE FROM verification_runs"),
     env.DB.prepare("DELETE FROM progress_notes"),
     env.DB.prepare("DELETE FROM oauth_ephemeral_states"),
     env.DB.prepare("DELETE FROM audit_events"),
     env.DB.prepare("DELETE FROM mcp_sessions"),
+    env.DB.prepare("DELETE FROM dashboard_sessions"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);
 });
@@ -338,6 +395,166 @@ describe("GET /", () => {
     expect(html).toContain("ProofOps");
     expect(html).toContain("GitHub 이벤트 연결됨");
     expect(html).toContain("/health");
+  });
+});
+
+describe("ProofOps dashboard", () => {
+  it("인증되지 않은 dashboard 요청을 GitHub 로그인으로 보낸다", async () => {
+    const response = await SELF.fetch("https://proofops.test/dashboard", {
+      redirect: "manual",
+    });
+
+    expect(response.status).toBe(302);
+    expect(requiredHeader(response, "location")).toBe(
+      "https://proofops.test/dashboard/login",
+    );
+  });
+
+  it("허용된 GitHub 사용자에게 안전한 dashboard session cookie를 발급한다", async () => {
+    const response = await loginToDashboard();
+
+    expect(response.status).toBe(302);
+    expect(requiredHeader(response, "location")).toBe(
+      "https://proofops.test/dashboard",
+    );
+    const cookie = requiredHeader(response, "set-cookie");
+    expect(cookie).toContain("proofops_dashboard_session=");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("SameSite=Lax");
+    expect(cookie).not.toContain("dashboard-github-token");
+  });
+
+  it("allowlist에 없는 GitHub 사용자의 dashboard 로그인을 거부한다", async () => {
+    const response = await loginToDashboard({ id: 404, login: "mallory" });
+
+    expect(response.status).toBe(403);
+    expect(response.headers.has("set-cookie")).toBe(false);
+  });
+
+  it("작업과 PR 및 최신 운영 검증을 인증된 사용자에게 표시한다", async () => {
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          `INSERT INTO tasks (
+            id, notion_page_id, notion_url, title, technical_status,
+            expected_repositories, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "task-dashboard",
+          "notion-dashboard",
+          "https://notion.so/task-dashboard",
+          "배포 <검증>",
+          "In Review",
+          JSON.stringify(["landit-ai", "landit-iac"]),
+          "2026-07-18T10:00:00.000Z",
+          "2026-07-18T12:00:00.000Z",
+        ),
+      env.DB
+        .prepare(
+          `INSERT INTO pull_requests (
+            id, task_id, repository, pr_number, pr_url, state, review_state,
+            ci_state, head_sha, linked_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "pr-dashboard",
+          "task-dashboard",
+          "Aragornnnnnn/landit-ai",
+          77,
+          "https://github.com/Aragornnnnnn/landit-ai/pull/77",
+          "open",
+          "approved",
+          "passed",
+          "a".repeat(40),
+          "2026-07-18T11:00:00.000Z",
+          "2026-07-18T11:00:00.000Z",
+        ),
+      env.DB
+        .prepare(
+          `INSERT INTO verification_runs (
+            id, task_id, repository, environment, workflow_run_id, status,
+            evidence_url, result_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "verify-old",
+          "task-dashboard",
+          "Aragornnnnnn/landit-ai",
+          "production",
+          1,
+          "failed",
+          "https://github.com/old",
+          JSON.stringify({ checks: [{ name: "ECS", status: "failed" }] }),
+          "2026-07-18T11:00:00.000Z",
+        ),
+      env.DB
+        .prepare(
+          `INSERT INTO verification_runs (
+            id, task_id, repository, environment, workflow_run_id, status,
+            evidence_url, result_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "verify-new",
+          "task-dashboard",
+          "Aragornnnnnn/landit-ai",
+          "production",
+          2,
+          "passed",
+          "https://github.com/new",
+          JSON.stringify({ checks: [{ name: "ECS", status: "passed" }] }),
+          "2026-07-18T12:00:00.000Z",
+        ),
+    ]);
+    const login = await loginToDashboard();
+    const cookie = requiredHeader(login, "set-cookie").split(";")[0];
+
+    const response = await SELF.fetch("https://proofops.test/dashboard", {
+      headers: { cookie },
+    });
+
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("배포 &lt;검증&gt;");
+    expect(html).not.toContain("배포 <검증>");
+    expect(html).toContain("Aragornnnnnn/landit-ai");
+    expect(html).toContain("approved");
+    expect(html).toContain("passed");
+    expect(html).toContain("https://github.com/new");
+    expect(html).not.toContain("https://github.com/old");
+    expect(html).toContain("alice");
+  });
+
+  it("빈 dashboard에 다음 행동을 안내한다", async () => {
+    const login = await loginToDashboard();
+    const cookie = requiredHeader(login, "set-cookie").split(";")[0];
+
+    const response = await SELF.fetch("https://proofops.test/dashboard", {
+      headers: { cookie },
+    });
+
+    expect(await response.text()).toContain("start_task");
+  });
+
+  it("로그아웃한 dashboard session은 다시 사용할 수 없다", async () => {
+    const login = await loginToDashboard();
+    const cookie = requiredHeader(login, "set-cookie").split(";")[0];
+
+    const logout = await SELF.fetch("https://proofops.test/dashboard/logout", {
+      method: "POST",
+      headers: { cookie },
+      redirect: "manual",
+    });
+    const dashboard = await SELF.fetch("https://proofops.test/dashboard", {
+      headers: { cookie },
+      redirect: "manual",
+    });
+
+    expect(logout.status).toBe(302);
+    expect(requiredHeader(logout, "set-cookie")).toContain("Max-Age=0");
+    expect(dashboard.status).toBe(302);
   });
 });
 
