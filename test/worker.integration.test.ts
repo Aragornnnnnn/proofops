@@ -329,6 +329,18 @@ describe("GET /health", () => {
   });
 });
 
+describe("GET /", () => {
+  it("ProofOps 접속 안내 화면을 반환한다", async () => {
+    const response = await SELF.fetch("https://proofops.test/");
+
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("ProofOps");
+    expect(html).toContain("GitHub 이벤트 연결됨");
+    expect(html).toContain("/health");
+  });
+});
+
 describe("POST /webhooks/github", () => {
   it("Bearer token 없이도 유효한 서명 요청을 처리한다", async () => {
     const body = JSON.stringify({ zen: "Keep it logically awesome." });
