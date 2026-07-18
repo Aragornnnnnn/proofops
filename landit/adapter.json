@@ -7,6 +7,7 @@
     "Aragornnnnnn/landit-fe"
   ],
   "verificationWorkflow": "proofops-verify.yml",
+  "verificationRef": "main",
   "statusMapping": {
     "In Progress": "In Progress",
     "In Review": "In Review",

@@ -12,8 +12,11 @@ import { handleGitHubWebhook, linkPullRequest } from "./webhook";
 const secret = "webhook-test-secret";
 const timestamp = "2026-07-18T00:00:00.000Z";
 const verificationSha = "0123456789abcdef0123456789abcdef01234567";
+const trustedWorkflowSha = "f".repeat(40);
+const verificationRequestId = "11111111-1111-4111-8111-111111111111";
 const verificationArtifact: VerificationResult = {
   schemaVersion: 1,
+  requestId: verificationRequestId,
   taskId: "task-1",
   repository: "Aragornnnnnn/landit-be",
   environment: "develop",
@@ -48,6 +51,42 @@ const verificationArtifact: VerificationResult = {
   ],
   observedAt: timestamp,
 };
+
+function artifactForRun(
+  runId: number,
+  overrides: Partial<VerificationResult> = {},
+): VerificationResult {
+  const evidenceUrl =
+    `https://github.com/Aragornnnnnn/landit-be/actions/runs/${runId}`;
+  return {
+    ...verificationArtifact,
+    checks: verificationArtifact.checks.map((check) =>
+      check.evidenceUrl ? { ...check, evidenceUrl } : check,
+    ),
+    ...overrides,
+  };
+}
+
+function verificationWorkflowPayload(
+  runId: number,
+  requestId: string = verificationRequestId,
+): Record<string, unknown> {
+  return {
+    action: "completed",
+    workflow_run: {
+      id: runId,
+      path: ".github/workflows/proofops-verify.yml",
+      event: "workflow_dispatch",
+      head_branch: "main",
+      head_sha: trustedWorkflowSha,
+      display_title: `ProofOps verification ${requestId}`,
+      html_url:
+        `https://github.com/Aragornnnnnn/landit-be/actions/runs/${runId}`,
+      pull_requests: [],
+    },
+    repository: { full_name: "Aragornnnnnn/landit-be" },
+  };
+}
 const currentPullRequest: LinkedPullRequestSnapshot = {
   repository: "Aragornnnnnn/landit-be",
   number: 42,
@@ -165,6 +204,36 @@ async function insertTaskAndPullRequest(): Promise<void> {
   ]);
 }
 
+async function insertVerificationRequest(
+  input: {
+    requestId?: string;
+    taskId?: string;
+    repository?: string;
+    environment?: "develop" | "prod";
+    commitSha?: string;
+  } = {},
+): Promise<void> {
+  await env.DB
+    .prepare(
+      `INSERT INTO verification_requests (
+        request_id, task_id, repository, environment, target_commit_sha,
+        trusted_ref, status, workflow_run_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    )
+    .bind(
+      input.requestId ?? verificationRequestId,
+      input.taskId ?? "task-1",
+      input.repository ?? "Aragornnnnnn/landit-be",
+      input.environment ?? "develop",
+      input.commitSha ?? verificationSha,
+      "main",
+      "dispatched",
+      timestamp,
+      timestamp,
+    )
+    .run();
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   await env.DB.batch([
@@ -203,11 +272,26 @@ beforeEach(async () => {
         PRIMARY KEY(provider, delivery_id)
       )`),
     env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS verification_runs (
-        id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS verification_requests (
+        request_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
         repository TEXT NOT NULL,
         environment TEXT NOT NULL,
+        target_commit_sha TEXT NOT NULL,
+        trusted_ref TEXT NOT NULL,
+        status TEXT NOT NULL,
+        workflow_run_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS verification_runs (
+        id TEXT PRIMARY KEY,
+        request_id TEXT REFERENCES verification_requests(request_id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        repository TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        commit_sha TEXT NOT NULL DEFAULT '',
         workflow_run_id INTEGER NOT NULL,
         status TEXT NOT NULL,
         evidence_url TEXT NOT NULL,
@@ -221,6 +305,7 @@ afterEach(async () => {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM pull_requests"),
     env.DB.prepare("DELETE FROM verification_runs"),
+    env.DB.prepare("DELETE FROM verification_requests"),
     env.DB.prepare("DELETE FROM webhook_deliveries"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);
@@ -409,8 +494,9 @@ describe("handleGitHubWebhook", () => {
     await expect(response.json()).resolves.toEqual({ status: "ignored" });
   });
 
-  it("PR 참조가 없는 검증 workflow_run도 연결된 repository와 SHA로 결과를 저장한다", async () => {
+  it("PR 참조가 없는 검증 workflow_run도 request ID로 결과를 저장한다", async () => {
     await insertTaskAndPullRequest();
+    await insertVerificationRequest();
     await env.DB
       .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
       .bind(verificationSha, "pr-1")
@@ -418,21 +504,14 @@ describe("handleGitHubWebhook", () => {
     const github = githubStub() as GitHubPort & {
       getVerificationArtifact: ReturnType<typeof vi.fn>;
     };
-    github.getVerificationArtifact = vi.fn().mockResolvedValue(verificationArtifact);
+    github.getVerificationArtifact = vi.fn().mockResolvedValue(artifactForRun(101));
 
     const response = await handleGitHubWebhook(
-      await webhookRequest("workflow_run", "delivery-verification", {
-        action: "completed",
-        workflow_run: {
-          id: 101,
-          path: ".github/workflows/proofops-verify.yml",
-          head_sha: verificationSha,
-          html_url:
-            "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
-          pull_requests: [],
-        },
-        repository: { full_name: "Aragornnnnnn/landit-be" },
-      }),
+      await webhookRequest(
+        "workflow_run",
+        "delivery-verification",
+        verificationWorkflowPayload(101),
+      ),
       { db: env.DB, webhookSecret: secret, github, notion: notionStub },
     );
 
@@ -441,27 +520,39 @@ describe("handleGitHubWebhook", () => {
     expect(github.getVerificationArtifact).toHaveBeenCalledWith({
       repository: "Aragornnnnnn/landit-be",
       workflowRunId: 101,
+      requestId: verificationRequestId,
     });
     await expect(
       env.DB
         .prepare(
-          "SELECT task_id, repository, environment, workflow_run_id, status, evidence_url, result_json FROM verification_runs",
+          "SELECT request_id, task_id, repository, environment, commit_sha, workflow_run_id, status, evidence_url, result_json FROM verification_runs",
         )
         .first(),
     ).resolves.toEqual({
+      request_id: verificationRequestId,
       task_id: "task-1",
       repository: "Aragornnnnnn/landit-be",
       environment: "develop",
+      commit_sha: verificationSha,
       workflow_run_id: 101,
       status: "passed",
       evidence_url:
         "https://github.com/Aragornnnnnn/landit-be/actions/runs/101",
-      result_json: JSON.stringify(verificationArtifact),
+      result_json: JSON.stringify(artifactForRun(101)),
     });
+    await expect(
+      env.DB
+        .prepare(
+          "SELECT status, workflow_run_id FROM verification_requests WHERE request_id = ?",
+        )
+        .bind(verificationRequestId)
+        .first(),
+    ).resolves.toEqual({ status: "passed", workflow_run_id: 101 });
   });
 
   it("필수 check가 unobservable인 결과는 Failed 상태로 수렴한다", async () => {
     await insertTaskAndPullRequest();
+    await insertVerificationRequest();
     await env.DB
       .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
       .bind(verificationSha, "pr-1")
@@ -470,9 +561,9 @@ describe("handleGitHubWebhook", () => {
       getVerificationArtifact: ReturnType<typeof vi.fn>;
     };
     github.getVerificationArtifact = vi.fn().mockResolvedValue({
-      ...verificationArtifact,
+      ...artifactForRun(102),
       status: "unobservable",
-      checks: verificationArtifact.checks.map((check) =>
+      checks: artifactForRun(102).checks.map((check) =>
         check.name === "ecs"
           ? { ...check, status: "unobservable", summary: "ECS를 관측하지 못했다." }
           : check,
@@ -494,18 +585,11 @@ describe("handleGitHubWebhook", () => {
     });
 
     const response = await handleGitHubWebhook(
-      await webhookRequest("workflow_run", "delivery-unobservable", {
-        action: "completed",
-        workflow_run: {
-          id: 102,
-          path: ".github/workflows/proofops-verify.yml",
-          head_sha: verificationSha,
-          html_url:
-            "https://github.com/Aragornnnnnn/landit-be/actions/runs/102",
-          pull_requests: [],
-        },
-        repository: { full_name: "Aragornnnnnn/landit-be" },
-      }),
+      await webhookRequest(
+        "workflow_run",
+        "delivery-unobservable",
+        verificationWorkflowPayload(102),
+      ),
       { db: env.DB, webhookSecret: secret, github, notion: notionStub },
     );
 
@@ -523,13 +607,14 @@ describe("handleGitHubWebhook", () => {
 
   it("문맥이 확인된 invalid artifact는 원문 없이 안전한 실패로 수렴한다", async () => {
     await insertTaskAndPullRequest();
+    await insertVerificationRequest();
     await env.DB
       .prepare("UPDATE pull_requests SET head_sha = ?, state = 'merged' WHERE id = ?")
       .bind(verificationSha, "pr-1")
       .run();
     const github = githubStub();
     vi.mocked(github.getVerificationArtifact).mockResolvedValue({
-      ...verificationArtifact,
+      ...artifactForRun(103),
       taskId: "attacker-task",
       checks: [
         {
@@ -551,16 +636,11 @@ describe("handleGitHubWebhook", () => {
     });
 
     const response = await handleGitHubWebhook(
-      await webhookRequest("workflow_run", "delivery-invalid-artifact", {
-        action: "completed",
-        workflow_run: {
-          id: 103,
-          path: ".github/workflows/proofops-verify.yml",
-          head_sha: verificationSha,
-          pull_requests: [],
-        },
-        repository: { full_name: "Aragornnnnnn/landit-be" },
-      }),
+      await webhookRequest(
+        "workflow_run",
+        "delivery-invalid-artifact",
+        verificationWorkflowPayload(103),
+      ),
       { db: env.DB, webhookSecret: secret, github, notion: notionStub },
     );
 
@@ -585,6 +665,7 @@ describe("handleGitHubWebhook", () => {
 
   it("artifact API의 일시 실패는 delivery를 되돌리고 재시도한다", async () => {
     await insertTaskAndPullRequest();
+    await insertVerificationRequest();
     await env.DB
       .prepare("UPDATE pull_requests SET head_sha = ? WHERE id = ?")
       .bind(verificationSha, "pr-1")
@@ -595,16 +676,11 @@ describe("handleGitHubWebhook", () => {
     );
 
     const response = await handleGitHubWebhook(
-      await webhookRequest("workflow_run", "delivery-artifact-retry", {
-        action: "completed",
-        workflow_run: {
-          id: 104,
-          path: ".github/workflows/proofops-verify.yml",
-          head_sha: verificationSha,
-          pull_requests: [],
-        },
-        repository: { full_name: "Aragornnnnnn/landit-be" },
-      }),
+      await webhookRequest(
+        "workflow_run",
+        "delivery-artifact-retry",
+        verificationWorkflowPayload(104),
+      ),
       { db: env.DB, webhookSecret: secret, github, notion: notionStub },
     );
 
@@ -621,6 +697,72 @@ describe("handleGitHubWebhook", () => {
         .bind("delivery-artifact-retry")
         .first(),
     ).resolves.toEqual({ count: 0 });
+  });
+
+  it("같은 저장소와 SHA를 공유하는 다른 작업으로 결과가 교차 귀속되지 않는다", async () => {
+    await insertTaskAndPullRequest();
+    await insertVerificationRequest();
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          `INSERT INTO tasks (
+            id, notion_page_id, notion_url, title, technical_status,
+            expected_repositories, last_sync_error, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "task-2",
+          "notion-page-2",
+          "https://notion.so/notion-page-2",
+          "같은 SHA 작업",
+          "Verifying",
+          '["landit-be"]',
+          null,
+          timestamp,
+          timestamp,
+        ),
+      env.DB
+        .prepare(
+          `INSERT INTO pull_requests (
+            id, task_id, repository, pr_number, pr_url, state,
+            review_state, ci_state, head_sha, linked_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          "pr-2",
+          "task-2",
+          "Aragornnnnnn/landit-be",
+          43,
+          "https://github.com/Aragornnnnnn/landit-be/pull/43",
+          "merged",
+          "approved",
+          "passed",
+          verificationSha,
+          "2026-07-18T00:01:00.000Z",
+          "2026-07-18T00:01:00.000Z",
+        ),
+    ]);
+    const github = githubStub();
+    vi.mocked(github.getVerificationArtifact).mockResolvedValue(artifactForRun(105));
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest(
+        "workflow_run",
+        "delivery-no-cross-attribution",
+        verificationWorkflowPayload(105),
+      ),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(
+      env.DB
+        .prepare("SELECT task_id, request_id FROM verification_runs")
+        .first(),
+    ).resolves.toEqual({
+      task_id: "task-1",
+      request_id: verificationRequestId,
+    });
   });
 });
 

@@ -64,6 +64,7 @@ describe("GitHubAppClient.getTaskSnapshot", () => {
                   {
                     repository: "Aragornnnnnn/landit-be",
                     status: "failed",
+                    commit_sha: "current",
                   },
                 ]
               : [
@@ -83,6 +84,108 @@ describe("GitHubAppClient.getTaskSnapshot", () => {
       number: 11,
       url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
       headSha: "current",
+      state: "merged",
+      review: "approved",
+      ci: "passed",
+    });
+
+    await expect(client.getTaskSnapshot("task-1")).resolves.toMatchObject({
+      requiredVerification: "failed",
+    });
+  });
+
+  it("SHA A의 passed 결과를 현재 선택된 SHA B에 재사용하지 않는다", async () => {
+    const shaA = "a".repeat(40);
+    const shaB = "b".repeat(40);
+    const database = {
+      prepare: (query: string) => ({
+        bind: () => ({
+          all: async () => ({
+            results: query.includes("verification_runs")
+              ? [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    status: "passed",
+                    commit_sha: shaA,
+                  },
+                ]
+              : [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                  },
+                ],
+          }),
+          first: async () => ({ expected_repositories: '["landit-be"]' }),
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    vi.spyOn(client, "getPullRequest").mockResolvedValue({
+      repository: "Aragornnnnnn/landit-be",
+      number: 11,
+      url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+      headSha: shaB,
+      state: "merged",
+      review: "approved",
+      ci: "passed",
+    });
+
+    await expect(client.getTaskSnapshot("task-1")).resolves.toMatchObject({
+      requiredVerification: "pending",
+      deployment: "none",
+    });
+  });
+
+  it("Webhook 도착 시각이 아니라 큰 workflow_run_id 결과를 최신으로 집계한다", async () => {
+    const sha = "c".repeat(40);
+    const database = {
+      prepare: (query: string) => ({
+        bind: () => ({
+          all: async () => ({
+            results: query.includes("verification_runs")
+              ? query.includes("ORDER BY workflow_run_id DESC")
+                ? [
+                    {
+                      repository: "Aragornnnnnn/landit-be",
+                      status: "failed",
+                      commit_sha: sha,
+                    },
+                    {
+                      repository: "Aragornnnnnn/landit-be",
+                      status: "passed",
+                      commit_sha: sha,
+                    },
+                  ]
+                : [
+                    {
+                      repository: "Aragornnnnnn/landit-be",
+                      status: "passed",
+                      commit_sha: sha,
+                    },
+                    {
+                      repository: "Aragornnnnnn/landit-be",
+                      status: "failed",
+                      commit_sha: sha,
+                    },
+                  ]
+              : [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                  },
+                ],
+          }),
+          first: async () => ({ expected_repositories: '["landit-be"]' }),
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    vi.spyOn(client, "getPullRequest").mockResolvedValue({
+      repository: "Aragornnnnnn/landit-be",
+      number: 11,
+      url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+      headSha: sha,
       state: "merged",
       review: "approved",
       ci: "passed",

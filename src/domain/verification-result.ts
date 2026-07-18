@@ -3,6 +3,7 @@ export type VerificationStatus = "pending" | "passed" | "failed" | "unobservable
 
 export interface VerificationResult {
   schemaVersion: 1;
+  requestId: string;
   taskId: string;
   repository: string;
   environment: "develop" | "prod";

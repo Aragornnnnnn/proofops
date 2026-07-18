@@ -2,8 +2,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import adapter from "../../landit/adapter.json";
 import type { Env } from "../env";
-import { createGitHubClient } from "../github/app-client";
+import { createGitHubClient, type GitHubPort } from "../github/app-client";
 import { linkPullRequest, reconcileTask } from "../github/webhook";
 import { createNotionClient } from "../notion/client";
 import type { TaskContext } from "../tasks/repository";
@@ -46,7 +47,7 @@ export interface ProofOpsTools {
     repository: string;
     environment: "develop" | "prod";
     commitSha: string;
-  }): Promise<{ workflowRunUrl: string }>;
+  }): Promise<{ requestId: string; workflowRunUrl: string }>;
 }
 
 export function createProofOpsTools(env: Env): ProofOpsTools {
@@ -91,18 +92,78 @@ export function createProofOpsTools(env: Env): ProofOpsTools {
     },
     async requestVerification(input) {
       await tasks.getContext(input.taskId);
-      const linkedCommit = await env.DB
-        .prepare(
-          `SELECT 1 AS linked FROM pull_requests
-           WHERE task_id = ? AND lower(repository) = lower(?)
-             AND lower(head_sha) = lower(?) LIMIT 1`,
-        )
-        .bind(input.taskId, input.repository, input.commitSha)
-        .first<{ linked: number }>();
-      if (!linkedCommit) throw new Error("INPUT_INVALID");
-      return github.dispatchVerification(input);
+      return requestVerification(input, { db: env.DB, github });
     },
   };
+}
+
+export async function requestVerification(
+  input: {
+    taskId: string;
+    repository: string;
+    environment: "develop" | "prod";
+    commitSha: string;
+  },
+  dependencies: {
+    db: D1Database;
+    github: Pick<GitHubPort, "dispatchVerification">;
+    now?: () => string;
+    newId?: () => string;
+  },
+): Promise<{ requestId: string; workflowRunUrl: string }> {
+  const linkedCommit = await dependencies.db
+    .prepare(
+      `SELECT 1 AS linked FROM pull_requests
+       WHERE task_id = ? AND lower(repository) = lower(?)
+         AND lower(head_sha) = lower(?) LIMIT 1`,
+    )
+    .bind(input.taskId, input.repository, input.commitSha)
+    .first<{ linked: number }>();
+  if (!linkedCommit) throw new Error("INPUT_INVALID");
+  const requestId = (dependencies.newId ?? (() => crypto.randomUUID()))();
+  const now = dependencies.now ?? (() => new Date().toISOString());
+  await dependencies.db
+    .prepare(
+      `INSERT INTO verification_requests (
+        request_id, task_id, repository, environment, target_commit_sha,
+        trusted_ref, status, workflow_run_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+    )
+    .bind(
+      requestId,
+      input.taskId,
+      input.repository,
+      input.environment,
+      input.commitSha,
+      adapter.verificationRef,
+      "pending",
+      now(),
+      now(),
+    )
+    .run();
+  try {
+    const dispatch = await dependencies.github.dispatchVerification({
+      ...input,
+      requestId,
+    });
+    await dependencies.db
+      .prepare(
+        `UPDATE verification_requests
+         SET status = 'dispatched', updated_at = ? WHERE request_id = ?`,
+      )
+      .bind(now(), requestId)
+      .run();
+    return { requestId, ...dispatch };
+  } catch (error) {
+    await dependencies.db
+      .prepare(
+        `UPDATE verification_requests
+         SET status = 'dispatch_failed', updated_at = ? WHERE request_id = ?`,
+      )
+      .bind(now(), requestId)
+      .run();
+    throw error;
+  }
 }
 
 export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): void {

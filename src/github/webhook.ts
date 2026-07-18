@@ -104,8 +104,9 @@ export async function handleGitHubWebhook(
 
 interface VerificationWorkflowRun {
   id: number;
+  requestId: string;
   repository: string;
-  commitSha: string;
+  headBranch: string;
   evidenceUrl: string;
 }
 
@@ -122,7 +123,14 @@ function extractVerificationRun(
     ? workflowRun.path.split("@")[0]
     : null;
   const id = workflowRun?.id;
-  const commitSha = workflowRun?.head_sha;
+  const workflowSha = workflowRun?.head_sha;
+  const headBranch = workflowRun?.head_branch;
+  const displayTitle = workflowRun?.display_title;
+  const requestId = typeof displayTitle === "string"
+    ? /^ProofOps verification ([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(
+        displayTitle,
+      )?.[1]
+    : undefined;
   const allowed =
     typeof repository === "string" &&
     adapter.allowedRepositories.some(
@@ -130,20 +138,24 @@ function extractVerificationRun(
     );
   if (
     payload.action !== "completed" ||
+    workflowRun?.event !== "workflow_dispatch" ||
     path !== `.github/workflows/${adapter.verificationWorkflow}` ||
     !allowed ||
     typeof id !== "number" ||
     !Number.isSafeInteger(id) ||
     id < 1 ||
-    typeof commitSha !== "string" ||
-    !/^[0-9a-f]{40}$/i.test(commitSha)
+    typeof workflowSha !== "string" ||
+    !/^[0-9a-f]{40}$/i.test(workflowSha) ||
+    typeof headBranch !== "string" ||
+    !requestId
   ) {
     return null;
   }
   return {
     id,
+    requestId,
     repository,
-    commitSha,
+    headBranch,
     evidenceUrl: `https://github.com/${repository}/actions/runs/${id}`,
   };
 }
@@ -152,95 +164,124 @@ async function processVerificationRun(
   dependencies: GitHubWebhookDependencies,
   run: VerificationWorkflowRun,
 ): Promise<boolean> {
-  const linked = await dependencies.db
+  const verificationRequest = await dependencies.db
     .prepare(
-      `SELECT task_id FROM pull_requests
-       WHERE lower(repository) = lower(?) AND lower(head_sha) = lower(?)
-       ORDER BY linked_at DESC, pr_number DESC LIMIT 1`,
+      `SELECT request_id, task_id, repository, environment, target_commit_sha,
+              trusted_ref, status
+       FROM verification_requests WHERE request_id = ?`,
     )
-    .bind(run.repository, run.commitSha)
-    .first<{ task_id: string }>();
-  if (!linked) return false;
+    .bind(run.requestId)
+    .first<{
+      request_id: string;
+      task_id: string;
+      repository: string;
+      environment: "develop" | "prod";
+      target_commit_sha: string;
+      trusted_ref: string;
+      status: string;
+    }>();
+  if (
+    !verificationRequest ||
+    verificationRequest.repository.toLowerCase() !== run.repository.toLowerCase() ||
+    verificationRequest.trusted_ref !== run.headBranch ||
+    (verificationRequest.status !== "pending" &&
+      verificationRequest.status !== "dispatched")
+  ) {
+    return false;
+  }
 
   let rawArtifact: unknown;
   try {
     rawArtifact = await dependencies.github.getVerificationArtifact({
       repository: run.repository,
       workflowRunId: run.id,
+      requestId: run.requestId,
     });
   } catch (error) {
     if (!isInvalidArtifactError(error)) throw error;
-    await recordVerificationRun(dependencies, run, {
-      taskId: linked.task_id,
+    await recordVerificationRun(dependencies, run, verificationRequest, {
       environment: "unknown",
       status: "failed",
       resultJson: JSON.stringify({ error: "VERIFICATION_ARTIFACT_INVALID" }),
     });
-    await reconcileTask(dependencies, linked.task_id);
+    await reconcileTask(dependencies, verificationRequest.task_id);
     return true;
   }
   let artifact;
   try {
     artifact = parseVerificationArtifact(rawArtifact, {
-      taskId: linked.task_id,
+      taskId: verificationRequest.task_id,
+      requestId: verificationRequest.request_id,
       repository: run.repository,
-      commitSha: run.commitSha,
+      environment: verificationRequest.environment,
+      commitSha: verificationRequest.target_commit_sha,
+      evidenceUrl: run.evidenceUrl,
     });
   } catch (error) {
     if (!isInvalidArtifactError(error)) throw error;
-    await recordVerificationRun(dependencies, run, {
-      taskId: linked.task_id,
+    await recordVerificationRun(dependencies, run, verificationRequest, {
       environment: "unknown",
       status: "failed",
       resultJson: JSON.stringify({ error: "VERIFICATION_ARTIFACT_INVALID" }),
     });
-    await reconcileTask(dependencies, linked.task_id);
+    await reconcileTask(dependencies, verificationRequest.task_id);
     return true;
   }
-  await recordVerificationRun(dependencies, run, {
-    taskId: linked.task_id,
+  await recordVerificationRun(dependencies, run, verificationRequest, {
     environment: artifact.environment,
     status: deriveVerificationStatus(artifact),
     resultJson: JSON.stringify(artifact),
   });
-  await reconcileTask(dependencies, linked.task_id);
+  await reconcileTask(dependencies, verificationRequest.task_id);
   return true;
 }
 
 async function recordVerificationRun(
   dependencies: GitHubWebhookDependencies,
   run: VerificationWorkflowRun,
+  verificationRequest: {
+    request_id: string;
+    task_id: string;
+    target_commit_sha: string;
+  },
   result: {
-    taskId: string;
     environment: "develop" | "prod" | "unknown";
     status: "passed" | "failed";
     resultJson: string;
   },
 ): Promise<void> {
   const now = dependencies.now ?? (() => new Date().toISOString());
-  await dependencies.db
-    .prepare(
+  await dependencies.db.batch([
+    dependencies.db.prepare(
       `INSERT INTO verification_runs (
-        id, task_id, repository, environment, workflow_run_id,
-        status, evidence_url, result_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, request_id, task_id, repository, environment, commit_sha,
+        workflow_run_id, status, evidence_url, result_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         status = excluded.status,
         evidence_url = excluded.evidence_url,
         result_json = excluded.result_json`,
-    )
-    .bind(
+    ).bind(
       `github-workflow-${run.id}`,
-      result.taskId,
+      verificationRequest.request_id,
+      verificationRequest.task_id,
       run.repository,
       result.environment,
+      verificationRequest.target_commit_sha,
       run.id,
       result.status,
       run.evidenceUrl,
       result.resultJson,
       now(),
-    )
-    .run();
+    ),
+    dependencies.db
+      .prepare(
+        `UPDATE verification_requests
+         SET status = ?, workflow_run_id = ?, updated_at = ?
+         WHERE request_id = ?`,
+      )
+      .bind(result.status, run.id, now(), verificationRequest.request_id),
+  ]);
 }
 
 function isInvalidArtifactError(error: unknown): boolean {

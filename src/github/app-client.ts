@@ -14,6 +14,7 @@ export interface LinkedPullRequestSnapshot extends PullRequestSnapshot {
 }
 
 export interface VerificationRequest {
+  requestId: string;
   taskId: string;
   repository: string;
   environment: "develop" | "prod";
@@ -29,6 +30,7 @@ export interface GitHubPort {
   getVerificationArtifact(input: {
     repository: string;
     workflowRunId: number;
+    requestId: string;
   }): Promise<unknown>;
 }
 
@@ -151,15 +153,23 @@ export class GitHubAppClient implements GitHubPort {
     );
     const verificationRows = await this.db
       .prepare(
-        `SELECT repository, status FROM verification_runs
-         WHERE task_id = ? ORDER BY created_at DESC, workflow_run_id DESC`,
+        `SELECT repository, commit_sha, status FROM verification_runs
+         WHERE task_id = ? ORDER BY workflow_run_id DESC`,
       )
       .bind(taskId)
-      .all<{ repository: string; status: string }>();
+      .all<{ repository: string; commit_sha: string; status: string }>();
+    const selectedShaByRepository = new Map(
+      pullRequests.map((pullRequest) => [
+        repositoryName(pullRequest.repository),
+        pullRequest.headSha.toLowerCase(),
+      ]),
+    );
     const latestVerificationByRepository = new Map<string, "passed" | "failed">();
     for (const row of verificationRows.results) {
       const name = repositoryName(row.repository);
       if (
+        typeof row.commit_sha === "string" &&
+        row.commit_sha.toLowerCase() === selectedShaByRepository.get(name) &&
         !latestVerificationByRepository.has(name) &&
         (row.status === "passed" || row.status === "failed")
       ) {
@@ -198,8 +208,9 @@ export class GitHubAppClient implements GitHubPort {
       `/repos/${owner}/${repositoryName}/actions/workflows/${workflow}/dispatches`,
       token,
       {
-        ref: input.commitSha,
+        ref: adapter.verificationRef,
         inputs: {
+          request_id: input.requestId,
           task_id: input.taskId,
           environment: input.environment,
           commit_sha: input.commitSha,
@@ -214,9 +225,14 @@ export class GitHubAppClient implements GitHubPort {
   async getVerificationArtifact(input: {
     repository: string;
     workflowRunId: number;
+    requestId: string;
   }): Promise<unknown> {
     const [owner, repositoryName] = assertAllowedRepository(input.repository);
-    if (!Number.isSafeInteger(input.workflowRunId) || input.workflowRunId < 1) {
+    if (
+      !Number.isSafeInteger(input.workflowRunId) ||
+      input.workflowRunId < 1 ||
+      !isUuid(input.requestId)
+    ) {
       throw new Error("INPUT_INVALID");
     }
     const token = await this.getInstallationToken(owner, repositoryName);
@@ -228,7 +244,8 @@ export class GitHubAppClient implements GitHubPort {
     );
     const artifact = artifacts.artifacts.find(
       (candidate) =>
-        candidate.name === "proofops-verification" && !candidate.expired,
+        candidate.name === `proofops-verification-${input.requestId}` &&
+        !candidate.expired,
     );
     if (!artifact) throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
 
@@ -236,18 +253,22 @@ export class GitHubAppClient implements GitHubPort {
       `https://api.github.com/repos/${owner}/${repositoryName}/actions/artifacts/${artifact.id}/zip`,
       {
         headers: this.githubHeaders(token),
-        redirect: "follow",
+        redirect: "manual",
       },
     );
-    if (!response.ok) throw new Error("GITHUB_API_FAILED");
-    const declaredSize = Number(response.headers.get("content-length") ?? "0");
+    const location = response.headers.get("location");
+    if (response.status < 300 || response.status >= 400 || !location) {
+      throw new Error("GITHUB_API_FAILED");
+    }
+    const downloadUrl = assertArtifactDownloadUrl(location);
+    const download = await this.fetcher(downloadUrl, { redirect: "error" });
+    if (!download.ok) throw new Error("GITHUB_API_FAILED");
+    const declaredSize = Number(download.headers.get("content-length") ?? "0");
     if (declaredSize > 1_048_576) {
+      await download.body?.cancel();
       throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
     }
-    const archive = new Uint8Array(await response.arrayBuffer());
-    if (archive.byteLength > 1_048_576) {
-      throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
-    }
+    const archive = await readLimitedBody(download, 1_048_576);
     try {
       let matchedFiles = 0;
       const files = unzipSync(archive, {
@@ -330,11 +351,70 @@ function assertVerificationRequest(input: VerificationRequest): [string, string]
   if (
     (input.environment !== "develop" && input.environment !== "prod") ||
     !input.taskId.trim() ||
+    !isUuid(input.requestId) ||
     !/^[0-9a-f]{40}$/i.test(input.commitSha)
   ) {
     throw new Error("INPUT_INVALID");
   }
   return [owner, repositoryName];
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  );
+}
+
+function assertArtifactDownloadUrl(location: string): string {
+  let url: URL;
+  try {
+    url = new URL(location);
+  } catch {
+    throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+  }
+  const host = url.hostname.toLowerCase();
+  const actionsHost =
+    /^(?:pipelines|pipelinesgh[a-z0-9-]*|results-receiver)\.actions\.githubusercontent\.com$/.test(
+      host,
+    );
+  const blobHost =
+    /^productionresultssa(?:[0-9]|1[0-9])\.blob\.core\.windows\.net$/.test(host);
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    (!actionsHost && !blobHost)
+  ) {
+    throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+  }
+  return url.toString();
+}
+
+async function readLimitedBody(
+  response: Response,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    size += next.value.byteLength;
+    if (size > maximumBytes) {
+      await reader.cancel();
+      throw new Error("GITHUB_VERIFICATION_ARTIFACT_INVALID");
+    }
+    chunks.push(next.value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function assertAllowedRepository(repository: string): [string, string] {

@@ -25,6 +25,7 @@ const verificationCheckSchema = z
 const verificationResultSchema = z
   .object({
     schemaVersion: z.literal(1),
+    requestId: z.string().uuid(),
     taskId: z.string().trim().min(1).max(200),
     repository: z.string().regex(/^[^/\s]+\/[^/\s]+$/),
     environment: z.enum(["develop", "prod"]),
@@ -46,14 +47,30 @@ const verificationResultSchema = z
 
 export function parseVerificationArtifact(
   input: unknown,
-  expected: { taskId: string; repository: string; commitSha: string },
+  expected: {
+    taskId: string;
+    requestId: string;
+    repository: string;
+    environment: "develop" | "prod";
+    commitSha: string;
+    evidenceUrl: string;
+  },
 ): VerificationResult {
   const parsed = verificationResultSchema.safeParse(input);
   if (
     !parsed.success ||
     parsed.data.taskId !== expected.taskId ||
+    parsed.data.requestId !== expected.requestId ||
     parsed.data.repository.toLowerCase() !== expected.repository.toLowerCase() ||
+    parsed.data.environment !== expected.environment ||
     parsed.data.commitSha.toLowerCase() !== expected.commitSha.toLowerCase()
+  ) {
+    throw new Error("VERIFICATION_ARTIFACT_INVALID");
+  }
+  if (
+    parsed.data.checks.some(
+      (check) => check.evidenceUrl && check.evidenceUrl !== expected.evidenceUrl,
+    )
   ) {
     throw new Error("VERIFICATION_ARTIFACT_INVALID");
   }

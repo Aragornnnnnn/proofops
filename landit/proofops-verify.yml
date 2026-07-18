@@ -1,8 +1,13 @@
 name: ProofOps Runtime Verification
+run-name: ProofOps verification ${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
     inputs:
+      request_id:
+        description: Durable ProofOps verification request ID
+        required: true
+        type: string
       task_id:
         description: ProofOps task ID
         required: true
@@ -29,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     env:
+      PROOFOPS_REQUEST_ID: ${{ inputs.request_id }}
       PROOFOPS_TASK_ID: ${{ inputs.task_id }}
       PROOFOPS_ENVIRONMENT: ${{ inputs.environment }}
       PROOFOPS_COMMIT_SHA: ${{ inputs.commit_sha }}
@@ -42,7 +48,7 @@ jobs:
         id: aws_auth
         if: env.PROOFOPS_AWS_ROLE_ARN != ''
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@d979d5b3a71173a29b74b5b88418bfda9437d885
         with:
           role-to-assume: ${{ env.PROOFOPS_AWS_ROLE_ARN }}
           aws-region: ap-northeast-2
@@ -55,6 +61,7 @@ jobs:
 
           deployment_status="unobservable"
           deployment_summary="AWS 런타임을 관측하지 못했다."
+          image_provenance_status="unobservable"
           ecs_status="unobservable"
           ecs_summary="ECS 서비스를 관측하지 못했다."
           alb_status="unobservable"
@@ -73,14 +80,31 @@ jobs:
               desired="$(jq -r '.services[0].desiredCount // 0' <<<"$service_json")"
               running="$(jq -r '.services[0].runningCount // 0' <<<"$service_json")"
               rollout="$(jq -r '[.services[0].deployments[]? | select(.status == "PRIMARY")][0].rolloutState // "UNKNOWN"' <<<"$service_json")"
+              task_definition="$(jq -r '[.services[0].deployments[]? | select(.status == "PRIMARY")][0].taskDefinition // empty' <<<"$service_json")"
               service_status="$(jq -r '.services[0].status // "UNKNOWN"' <<<"$service_json")"
 
-              if [[ "$rollout" == "COMPLETED" && "$desired" -gt 0 && "$running" == "$desired" ]]; then
+              if [[ -n "$task_definition" ]]; then
+                task_definition_json="$(aws ecs describe-task-definition \
+                  --task-definition "$task_definition" \
+                  --output json 2>/dev/null)"
+                essential_image_count="$(jq -r '[.taskDefinition.containerDefinitions[]? | select(.essential != false) | .image] | length' <<<"$task_definition_json" 2>/dev/null)"
+                matching_image_count="$(jq -r --arg sha "$PROOFOPS_COMMIT_SHA" '[.taskDefinition.containerDefinitions[]? | select(.essential != false) | .image | ascii_downcase | select(test("(^|[^0-9a-f])" + ($sha | ascii_downcase) + "([^0-9a-f]|$)"))] | length' <<<"$task_definition_json" 2>/dev/null)"
+                if [[ "$essential_image_count" -gt 0 && "$matching_image_count" == "$essential_image_count" ]]; then
+                  image_provenance_status="passed"
+                else
+                  image_provenance_status="failed"
+                fi
+              fi
+
+              if [[ "$rollout" == "COMPLETED" && "$desired" -gt 0 && "$running" == "$desired" && "$image_provenance_status" == "passed" ]]; then
                 deployment_status="passed"
-                deployment_summary="현재 ECS 배포가 완료됐고 실행 수가 안정적이다."
+                deployment_summary="현재 ECS 배포가 안정 상태이고 대상 commit SHA 이미지가 실행 중이다."
+              elif [[ "$rollout" == "COMPLETED" && "$desired" -gt 0 && "$running" == "$desired" && "$image_provenance_status" == "unobservable" ]]; then
+                deployment_status="unobservable"
+                deployment_summary="ECS 배포는 안정 상태지만 실행 이미지의 commit SHA를 관측하지 못했다."
               else
                 deployment_status="failed"
-                deployment_summary="현재 ECS 배포가 완료 또는 안정 상태가 아니다."
+                deployment_summary="ECS 배포가 불안정하거나 실행 이미지가 대상 commit SHA와 다르다."
               fi
 
               if [[ "$service_status" == "ACTIVE" && "$desired" -gt 0 && "$running" == "$desired" ]]; then
@@ -133,6 +157,7 @@ jobs:
           done
 
           jq -n \
+            --arg request_id "$PROOFOPS_REQUEST_ID" \
             --arg task_id "$PROOFOPS_TASK_ID" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg environment "$PROOFOPS_ENVIRONMENT" \
@@ -150,6 +175,7 @@ jobs:
             --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
             '{
               schemaVersion: 1,
+              requestId: $request_id,
               taskId: $task_id,
               repository: $repository,
               environment: $environment,
@@ -169,9 +195,9 @@ jobs:
 
       - name: Upload standardized verification result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: proofops-verification
+          name: proofops-verification-${{ inputs.request_id }}
           path: proofops-verification-result.json
           if-no-files-found: error
           retention-days: 14

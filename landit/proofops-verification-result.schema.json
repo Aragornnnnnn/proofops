@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schemaVersion",
+    "requestId",
     "taskId",
     "repository",
     "environment",
@@ -16,6 +17,7 @@
   ],
   "properties": {
     "schemaVersion": { "const": 1 },
+    "requestId": { "type": "string", "format": "uuid" },
     "taskId": { "type": "string", "minLength": 1, "maxLength": 200 },
     "repository": {
       "type": "string",

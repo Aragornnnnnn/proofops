@@ -61,5 +61,6 @@ export const progressNoteSchema = z.object({
 });
 
 export const verificationDispatchSchema = z.object({
+  requestId: z.string().uuid(),
   workflowRunUrl: z.string().url(),
 });
