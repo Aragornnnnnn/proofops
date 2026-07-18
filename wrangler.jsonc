@@ -11,6 +11,20 @@
       "migrations_dir": "migrations"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "ProofOpsMcp"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ProofOpsMcp"]
+    }
+  ],
   "vars": {
     "ENVIRONMENT": "local"
   }
