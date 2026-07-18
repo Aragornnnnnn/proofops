@@ -1,4 +1,9 @@
 {
   "product": "landit",
-  "allowedRepositories": ["landit-be", "landit-ai", "landit-iac", "landit-fe"]
+  "allowedRepositories": [
+    "Aragornnnnnn/landit-be",
+    "Aragornnnnnn/landit-ai",
+    "Aragornnnnnn/landit-iac",
+    "Aragornnnnnn/landit-fe"
+  ]
 }

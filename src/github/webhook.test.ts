@@ -11,9 +11,9 @@ import { handleGitHubWebhook, linkPullRequest } from "./webhook";
 const secret = "webhook-test-secret";
 const timestamp = "2026-07-18T00:00:00.000Z";
 const currentPullRequest: LinkedPullRequestSnapshot = {
-  repository: "landit/landit-be",
+  repository: "Aragornnnnnn/landit-be",
   number: 42,
-  url: "https://github.com/landit/landit-be/pull/42",
+  url: "https://github.com/Aragornnnnnn/landit-be/pull/42",
   headSha: "current-api-sha",
   state: "open",
   review: "changes_requested",
@@ -112,9 +112,9 @@ async function insertTaskAndPullRequest(): Promise<void> {
       .bind(
         "pr-1",
         "task-1",
-        "landit/landit-be",
+        "Aragornnnnnn/landit-be",
         42,
-        "https://github.com/landit/landit-be/pull/42",
+        "https://github.com/Aragornnnnnn/landit-be/pull/42",
         "open",
         "pending",
         "pending",
@@ -256,6 +256,78 @@ describe("handleGitHubWebhook", () => {
     });
     expect(github.getPullRequest).toHaveBeenCalledTimes(3);
   });
+
+  it("PR 저장 뒤 재조정 실패를 재전송하면 변경이 없어도 작업 상태를 복구한다", async () => {
+    await insertTaskAndPullRequest();
+    const github = githubStub();
+    vi.mocked(github.getTaskSnapshot)
+      .mockRejectedValueOnce(new Error("temporary GitHub failure"))
+      .mockResolvedValueOnce(currentTaskSnapshot);
+
+    const first = await handleGitHubWebhook(
+      await webhookRequest("pull_request", "delivery-retry", pullRequestOpened),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+    const second = await handleGitHubWebhook(
+      await webhookRequest("pull_request", "delivery-retry", pullRequestOpened),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(first.status).toBe(502);
+    expect(second.status).toBe(202);
+    await expect(second.json()).resolves.toEqual({ status: "processed" });
+    await expect(
+      env.DB
+        .prepare("SELECT technical_status FROM tasks WHERE id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({ technical_status: "Blocked" });
+    expect(github.getTaskSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it("Notion 갱신 실패와 무관하게 processed를 반환하고 안전한 오류를 저장한다", async () => {
+    await insertTaskAndPullRequest();
+    const github = githubStub();
+    notionStub.updateTechnicalStatus.mockRejectedValueOnce(
+      new Error("secret-bearing Notion response"),
+    );
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest("pull_request", "delivery-notion-failure", pullRequestOpened),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "processed" });
+    await expect(
+      env.DB
+        .prepare("SELECT technical_status, last_sync_error FROM tasks WHERE id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({
+      technical_status: "Blocked",
+      last_sync_error: "NOTION_SYNC_FAILED",
+    });
+  });
+
+  it("PR이 없는 workflow_run은 Task 7까지 ignored로 처리한다", async () => {
+    const response = await handleGitHubWebhook(
+      await webhookRequest("workflow_run", "delivery-workflow", {
+        action: "completed",
+        workflow_run: { pull_requests: [] },
+        repository: { full_name: "Aragornnnnnn/landit-iac" },
+      }),
+      {
+        db: env.DB,
+        webhookSecret: secret,
+        github: githubStub(),
+        notion: notionStub,
+      },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "ignored" });
+  });
 });
 
 describe("linkPullRequest", () => {
@@ -267,6 +339,21 @@ describe("linkPullRequest", () => {
         {
           taskId: "task-1",
           pullRequestUrl: "https://github.com/attacker/other/pull/1",
+        },
+        { db: env.DB, github, notion: notionStub },
+      ),
+    ).rejects.toThrow("GITHUB_REPOSITORY_NOT_ALLOWED");
+    expect(github.getPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("허용 저장소와 basename이 같아도 다른 owner이면 조회 전에 거부한다", async () => {
+    const github = githubStub();
+
+    await expect(
+      linkPullRequest(
+        {
+          taskId: "task-1",
+          pullRequestUrl: "https://github.com/attacker/landit-be/pull/42",
         },
         { db: env.DB, github, notion: notionStub },
       ),
@@ -303,7 +390,7 @@ describe("linkPullRequest", () => {
     const context = await linkPullRequest(
       {
         taskId: "task-1",
-        pullRequestUrl: "https://github.com/landit/landit-be/pull/42",
+        pullRequestUrl: "https://github.com/Aragornnnnnn/landit-be/pull/42",
       },
       { db: env.DB, github, notion: notionStub },
     );
@@ -314,7 +401,7 @@ describe("linkPullRequest", () => {
         .prepare("SELECT repository, pr_number, head_sha FROM pull_requests")
         .first(),
     ).resolves.toEqual({
-      repository: "landit/landit-be",
+      repository: "Aragornnnnnn/landit-be",
       pr_number: 42,
       head_sha: "current-api-sha",
     });

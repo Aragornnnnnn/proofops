@@ -42,11 +42,21 @@ interface PullRequestApiResponse {
 }
 
 interface ReviewApiResponse {
+  id: number;
+  user: { id: number } | null;
   state: string;
+  submitted_at: string | null;
 }
 
 interface CheckRunsApiResponse {
   check_runs: Array<{ status: string; conclusion: string | null }>;
+}
+
+export interface GitHubReview {
+  id: number;
+  reviewerId: number | string;
+  state: string;
+  submittedAt: string | null;
 }
 
 export class GitHubAppClient implements GitHubPort {
@@ -78,14 +88,25 @@ export class GitHubAppClient implements GitHubPort {
         installationAuthentication.token,
       );
       const [reviews, checks] = await Promise.all([
-        this.request<ReviewApiResponse[]>(
-          `${path}/pulls/${reference.number}/reviews?per_page=100`,
-          installationAuthentication.token,
-        ),
-        this.request<CheckRunsApiResponse>(
-          `${path}/commits/${pullRequest.head.sha}/check-runs?per_page=100`,
-          installationAuthentication.token,
-        ),
+        collectGitHubPages(async (page, perPage) => {
+          const response = await this.request<ReviewApiResponse[]>(
+            `${path}/pulls/${reference.number}/reviews?per_page=${perPage}&page=${page}`,
+            installationAuthentication.token,
+          );
+          return response.map((review) => ({
+            id: review.id,
+            reviewerId: review.user?.id ?? `deleted-${review.id}`,
+            state: review.state,
+            submittedAt: review.submitted_at,
+          }));
+        }),
+        collectGitHubPages(async (page, perPage) => {
+          const response = await this.request<CheckRunsApiResponse>(
+            `${path}/commits/${pullRequest.head.sha}/check-runs?per_page=${perPage}&page=${page}`,
+            installationAuthentication.token,
+          );
+          return response.check_runs;
+        }),
       ]);
       return {
         repository: pullRequest.base.repo.full_name,
@@ -93,8 +114,8 @@ export class GitHubAppClient implements GitHubPort {
         url: pullRequest.html_url,
         headSha: pullRequest.head.sha,
         state: pullRequest.merged || pullRequest.merged_at ? "merged" : pullRequest.state,
-        review: deriveReviewState(reviews),
-        ci: deriveCiState(checks.check_runs),
+        review: deriveCurrentReviewState(reviews),
+        ci: deriveCiState(checks),
       };
     } catch {
       throw new Error("GITHUB_READ_FAILED");
@@ -146,10 +167,36 @@ export function createGitHubClient(
   });
 }
 
-function deriveReviewState(
-  reviews: ReviewApiResponse[],
+export async function collectGitHubPages<T>(
+  fetchPage: (page: number, perPage: number) => Promise<T[]>,
+): Promise<T[]> {
+  const perPage = 100;
+  const items: T[] = [];
+  for (let page = 1; ; page += 1) {
+    const next = await fetchPage(page, perPage);
+    items.push(...next);
+    if (next.length < perPage) return items;
+  }
+}
+
+export function deriveCurrentReviewState(
+  reviews: GitHubReview[],
 ): PullRequestSnapshot["review"] {
-  const states = reviews.map((review) => review.state.toUpperCase());
+  const latestByReviewer = new Map<number | string, GitHubReview>();
+  const ordered = [...reviews].sort((left, right) => {
+    const submitted = (left.submittedAt ?? "").localeCompare(
+      right.submittedAt ?? "",
+    );
+    return submitted || left.id - right.id;
+  });
+  for (const review of ordered) {
+    const state = review.state.toUpperCase();
+    if (state !== "APPROVED" && state !== "CHANGES_REQUESTED") continue;
+    latestByReviewer.set(review.reviewerId, review);
+  }
+  const states = [...latestByReviewer.values()].map((review) =>
+    review.state.toUpperCase(),
+  );
   if (states.includes("CHANGES_REQUESTED")) return "changes_requested";
   if (states.includes("APPROVED")) return "approved";
   return "pending";

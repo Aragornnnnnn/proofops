@@ -46,7 +46,7 @@ export function parsePullRequestUrl(url: string): PullRequestReference {
 export function assertAllowedPullRequest(url: string): PullRequestReference {
   const reference = parsePullRequestUrl(url);
   const allowed = adapter.allowedRepositories.some(
-    (repository) => repository.toLowerCase() === reference.repositoryName.toLowerCase(),
+    (repository) => repository.toLowerCase() === reference.repository.toLowerCase(),
   );
   if (!allowed) throw new Error("GITHUB_REPOSITORY_NOT_ALLOWED");
   return reference;

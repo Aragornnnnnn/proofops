@@ -74,8 +74,8 @@ export async function handleGitHubWebhook(
 
     if (hasPullRequestChanged(linked, pullRequest)) {
       await persistPullRequest(dependencies, linked.taskId, linked.id, pullRequest);
-      await reconcileTask(dependencies, linked.taskId);
     }
+    await reconcileTask(dependencies, linked.taskId);
     return jsonResponse(202, "processed");
   } catch {
     await dependencies.db
