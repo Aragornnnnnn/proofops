@@ -211,6 +211,7 @@ async function insertVerificationRequest(
     repository?: string;
     environment?: "develop" | "prod";
     commitSha?: string;
+    status?: string;
   } = {},
 ): Promise<void> {
   await env.DB
@@ -227,7 +228,7 @@ async function insertVerificationRequest(
       input.environment ?? "develop",
       input.commitSha ?? verificationSha,
       "main",
-      "dispatched",
+      input.status ?? "dispatched",
       timestamp,
       timestamp,
     )
@@ -548,6 +549,33 @@ describe("handleGitHubWebhook", () => {
         .bind(verificationRequestId)
         .first(),
     ).resolves.toEqual({ status: "passed", workflow_run_id: 101 });
+  });
+
+  it("post-dispatch D1 갱신이 실패해 pending인 요청도 Webhook으로 완료한다", async () => {
+    await insertTaskAndPullRequest();
+    await insertVerificationRequest({ status: "pending" });
+    const github = githubStub();
+    vi.mocked(github.getVerificationArtifact).mockResolvedValue(artifactForRun(106));
+
+    const response = await handleGitHubWebhook(
+      await webhookRequest(
+        "workflow_run",
+        "delivery-pending-verification",
+        verificationWorkflowPayload(106),
+      ),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ status: "processed" });
+    await expect(
+      env.DB
+        .prepare(
+          "SELECT status, workflow_run_id FROM verification_requests WHERE request_id = ?",
+        )
+        .bind(verificationRequestId)
+        .first(),
+    ).resolves.toEqual({ status: "passed", workflow_run_id: 106 });
   });
 
   it("필수 check가 unobservable인 결과는 Failed 상태로 수렴한다", async () => {

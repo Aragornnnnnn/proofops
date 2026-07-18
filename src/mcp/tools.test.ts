@@ -89,6 +89,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await env.DB.batch([
+    env.DB.prepare("DROP TRIGGER IF EXISTS fail_dispatched_update"),
     env.DB.prepare("DELETE FROM verification_requests"),
     env.DB.prepare("DELETE FROM pull_requests"),
     env.DB.prepare("DELETE FROM tasks"),
@@ -170,5 +171,85 @@ describe("requestVerification", () => {
         .bind(requestId)
         .first(),
     ).resolves.toEqual({ status: "dispatch_failed" });
+  });
+
+  it("GitHub dispatch 성공 뒤 dispatched 갱신이 실패해도 pending을 보존한다", async () => {
+    await env.DB
+      .prepare(
+        `CREATE TRIGGER fail_dispatched_update
+         BEFORE UPDATE OF status ON verification_requests
+         WHEN NEW.status = 'dispatched'
+         BEGIN
+           SELECT RAISE(ABORT, 'simulated dispatched update failure');
+         END`,
+      )
+      .run();
+    const dispatchVerification = vi.fn().mockResolvedValue({
+      workflowRunUrl:
+        "https://github.com/Aragornnnnnn/landit-be/actions/workflows/proofops-verify.yml",
+    });
+
+    await expect(
+      requestVerification(
+        {
+          taskId: "task-1",
+          repository: "Aragornnnnnn/landit-be",
+          environment: "develop",
+          commitSha,
+        },
+        {
+          db: env.DB,
+          github: { dispatchVerification },
+          now: () => timestamp,
+          newId: () => requestId,
+        },
+      ),
+    ).resolves.toMatchObject({ requestId });
+    await expect(
+      env.DB
+        .prepare("SELECT status FROM verification_requests WHERE request_id = ?")
+        .bind(requestId)
+        .first(),
+    ).resolves.toEqual({ status: "pending" });
+  });
+
+  it("빠른 Webhook의 terminal 상태를 post-dispatch 갱신으로 되돌리지 않는다", async () => {
+    const dispatchVerification = vi.fn().mockImplementation(async () => {
+      await env.DB
+        .prepare(
+          `UPDATE verification_requests
+           SET status = 'passed', workflow_run_id = 777 WHERE request_id = ?`,
+        )
+        .bind(requestId)
+        .run();
+      return {
+        workflowRunUrl:
+          "https://github.com/Aragornnnnnn/landit-be/actions/workflows/proofops-verify.yml",
+      };
+    });
+
+    await requestVerification(
+      {
+        taskId: "task-1",
+        repository: "Aragornnnnnn/landit-be",
+        environment: "develop",
+        commitSha,
+      },
+      {
+        db: env.DB,
+        github: { dispatchVerification },
+        now: () => timestamp,
+        newId: () => requestId,
+      },
+    );
+
+    await expect(
+      env.DB
+        .prepare(
+          "SELECT status, workflow_run_id FROM verification_requests WHERE request_id = ?",
+        )
+        .bind(requestId)
+        .first(),
+    ).resolves.toEqual({ status: "passed", workflow_run_id: 777 });
   });
 });

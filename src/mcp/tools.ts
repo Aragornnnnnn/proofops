@@ -141,29 +141,40 @@ export async function requestVerification(
       now(),
     )
     .run();
+  let dispatch: { workflowRunUrl: string };
   try {
-    const dispatch = await dependencies.github.dispatchVerification({
+    dispatch = await dependencies.github.dispatchVerification({
       ...input,
       requestId,
     });
-    await dependencies.db
-      .prepare(
-        `UPDATE verification_requests
-         SET status = 'dispatched', updated_at = ? WHERE request_id = ?`,
-      )
-      .bind(now(), requestId)
-      .run();
-    return { requestId, ...dispatch };
   } catch (error) {
-    await dependencies.db
-      .prepare(
-        `UPDATE verification_requests
-         SET status = 'dispatch_failed', updated_at = ? WHERE request_id = ?`,
-      )
-      .bind(now(), requestId)
-      .run();
+    try {
+      await dependencies.db
+        .prepare(
+          `UPDATE verification_requests
+           SET status = 'dispatch_failed', updated_at = ?
+           WHERE request_id = ? AND status = 'pending'`,
+        )
+        .bind(now(), requestId)
+        .run();
+    } catch {
+      // 요청은 pending으로 남아 늦게 도착한 Webhook과 계속 상관관계가 유지된다.
+    }
     throw error;
   }
+  try {
+    await dependencies.db
+      .prepare(
+        `UPDATE verification_requests
+         SET status = 'dispatched', updated_at = ?
+         WHERE request_id = ? AND status = 'pending'`,
+      )
+      .bind(now(), requestId)
+      .run();
+  } catch {
+    // GitHub dispatch는 성공했으므로 pending을 실패 상태로 오분류하지 않는다.
+  }
+  return { requestId, ...dispatch };
 }
 
 export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): void {
