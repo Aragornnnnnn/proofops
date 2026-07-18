@@ -1,0 +1,3 @@
+# ProofOps MCP 서버의 Codex 클라이언트 예시 설정
+[mcp_servers.proofops]
+url = "http://127.0.0.1:8787/mcp"

@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest",
     "typecheck": "tsc --noEmit",
+    "check:client-docs": "node scripts/check-client-docs.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
