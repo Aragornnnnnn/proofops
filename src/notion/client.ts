@@ -1,7 +1,6 @@
 // Notion API 호출을 안전한 ProofOps 이슈 포트로 변환한다
 import { Client as NotionApiClient } from "@notionhq/client";
 import type { Env } from "../env";
-import type { TechnicalStatus } from "../domain/types";
 import { mapNotionPage, type NotionPage } from "./mapper";
 import type { CreateIssueInput, NotionIssue, NotionPort } from "./service";
 
@@ -9,7 +8,7 @@ export interface NotionPagesApi {
   retrieve(args: { page_id: string }): Promise<unknown>;
   update(args: {
     page_id: string;
-    properties: Record<string, { status: { name: TechnicalStatus } }>;
+    properties: Record<string, { status: { name: string } }>;
   }): Promise<unknown>;
 }
 
@@ -37,7 +36,7 @@ export class NotionClient implements NotionPort {
     }
   }
 
-  async updateTechnicalStatus(pageId: string, status: TechnicalStatus): Promise<void> {
+  async updateTechnicalStatus(pageId: string, status: string): Promise<void> {
     try {
       await this.pages.update({
         page_id: normalizePageId(pageId),

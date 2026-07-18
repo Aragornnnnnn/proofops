@@ -12,7 +12,9 @@ export interface TaskRecord {
   lastSyncError: string | null;
 }
 
-export type TaskContext = TaskRecord;
+export interface TaskContext extends TaskRecord {
+  missingRepositories: string[];
+}
 
 export interface TaskRepository {
   upsertFromNotion(issue: NotionIssue): Promise<TaskRecord>;
@@ -170,7 +172,20 @@ export class D1TaskRepository implements TaskRepository {
       .bind(taskId)
       .first<TaskRow>();
     if (!task) throw new Error("TASK_NOT_FOUND");
-    return toTaskRecord(task);
+    const record = toTaskRecord(task);
+    const pullRequests = await this.db
+      .prepare("SELECT repository FROM pull_requests WHERE task_id = ? ORDER BY updated_at DESC, pr_number DESC")
+      .bind(taskId)
+      .all<{ repository: string }>();
+    const connectedRepositories = new Set(
+      pullRequests.results.map((pullRequest) => repositoryName(pullRequest.repository)),
+    );
+    return {
+      ...record,
+      missingRepositories: record.expectedRepositories.filter(
+        (repository) => !connectedRepositories.has(repositoryName(repository)),
+      ),
+    };
   }
 
   private async findByNotionPageId(pageId: string): Promise<TaskRecord | null> {
@@ -181,6 +196,10 @@ export class D1TaskRepository implements TaskRepository {
       .first<TaskRow>();
     return task ? toTaskRecord(task) : null;
   }
+}
+
+function repositoryName(repository: string): string {
+  return repository.trim().toLowerCase().split("/").at(-1) ?? "";
 }
 
 interface TaskRow {

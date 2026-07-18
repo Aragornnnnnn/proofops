@@ -12,6 +12,7 @@ export type TechnicalStatus =
   | "Failed";
 
 export interface PullRequestSnapshot {
+  repository?: string;
   state: "open" | "merged" | "closed";
   review: "pending" | "approved" | "changes_requested";
   ci: "pending" | "passed" | "failed";
@@ -19,6 +20,7 @@ export interface PullRequestSnapshot {
 
 export interface TaskSnapshot {
   started: boolean;
+  expectedRepositories: string[];
   pullRequests: PullRequestSnapshot[];
   deployment: "none" | "running" | "succeeded" | "failed";
   requiredVerification: VerificationResult;

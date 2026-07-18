@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Env } from "../env";
 import { createGitHubClient } from "../github/app-client";
-import { linkPullRequest } from "../github/webhook";
+import { linkPullRequest, reconcileTask } from "../github/webhook";
 import { createNotionClient } from "../notion/client";
 import type { TaskContext } from "../tasks/repository";
 import { D1TaskRepository } from "../tasks/repository";
@@ -45,13 +45,15 @@ export function createProofOpsTools(env: Env): ProofOpsTools {
   const tasks = new D1TaskRepository(env.DB);
   const notion = createNotionClient(env);
   const github = createGitHubClient(env);
-  const taskService = new TaskService(tasks, notion);
+  const taskService = new TaskService(tasks, notion, (taskId) =>
+    reconcileTask({ db: env.DB, github, notion }, taskId),
+  );
 
   return {
     startTask: ({ notionPageIdOrUrl }) => taskService.startTask(notionPageIdOrUrl),
     linkPullRequest: (input) =>
       linkPullRequest(input, { db: env.DB, github, notion }),
-    getTaskStatus: ({ taskId }) => tasks.getContext(taskId),
+    getTaskStatus: ({ taskId }) => taskService.getTaskStatus(taskId),
     async recordProgress({ taskId, kind, summary, evidenceUrl }) {
       await tasks.getContext(taskId);
 

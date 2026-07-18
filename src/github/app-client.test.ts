@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   collectGitHubPages,
   deriveCurrentReviewState,
+  GitHubAppClient,
   type GitHubReview,
 } from "./app-client";
 
@@ -48,5 +49,69 @@ describe("collectGitHubPages", () => {
       [1, 100],
       [2, 100],
     ]);
+  });
+});
+
+describe("GitHubAppClient.getTaskSnapshot", () => {
+  it("예상 저장소별 최신 연결 PR만 현재 상태로 조회한다", async () => {
+    const database = {
+      prepare: (query: string) => ({
+        bind: () => ({
+          all: async () => ({
+            results: [
+              {
+                repository: "Aragornnnnnn/landit-be",
+                pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+              },
+              {
+                repository: "Aragornnnnnn/landit-be",
+                pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+              },
+              {
+                repository: "Aragornnnnnn/landit-ai",
+                pr_url: "https://github.com/Aragornnnnnn/landit-ai/pull/20",
+              },
+              {
+                repository: "Aragornnnnnn/landit-fe",
+                pr_url: "https://github.com/Aragornnnnnn/landit-fe/pull/30",
+              },
+            ],
+          }),
+          first: async () =>
+            query.includes("expected_repositories")
+              ? { expected_repositories: '["landit-be", "landit-ai"]' }
+              : null,
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    const getPullRequest = vi
+      .spyOn(client, "getPullRequest")
+      .mockImplementation(async (url) => ({
+        repository: url.includes("landit-ai")
+          ? "Aragornnnnnn/landit-ai"
+          : "Aragornnnnnn/landit-be",
+        number: url.endsWith("/20") ? 20 : 11,
+        url,
+        headSha: "current",
+        state: "merged",
+        review: "approved",
+        ci: "passed",
+      }));
+
+    await expect(client.getTaskSnapshot("task-1")).resolves.toMatchObject({
+      expectedRepositories: ["landit-be", "landit-ai"],
+      pullRequests: [
+        expect.objectContaining({ repository: "Aragornnnnnn/landit-be", number: 11 }),
+        expect.objectContaining({ repository: "Aragornnnnnn/landit-ai", number: 20 }),
+      ],
+    });
+    expect(getPullRequest).toHaveBeenCalledTimes(2);
+    expect(getPullRequest).toHaveBeenCalledWith(
+      "https://github.com/Aragornnnnnn/landit-be/pull/11",
+    );
+    expect(getPullRequest).not.toHaveBeenCalledWith(
+      "https://github.com/Aragornnnnnn/landit-be/pull/10",
+    );
   });
 });

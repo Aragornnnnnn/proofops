@@ -19,10 +19,7 @@ export function deriveTechnicalStatus(snapshot: TaskSnapshot): TechnicalStatus {
   ) {
     return "Changes Requested";
   }
-  if (
-    snapshot.pullRequests.length > 0 &&
-    snapshot.pullRequests.every((pullRequest) => pullRequest.state === "merged")
-  ) {
+  if (hasMergedPullRequestForEveryExpectedRepository(snapshot)) {
     if (snapshot.deployment === "running") return "Deploying";
     if (
       snapshot.deployment === "succeeded" &&
@@ -36,4 +33,29 @@ export function deriveTechnicalStatus(snapshot: TaskSnapshot): TechnicalStatus {
     return "In Review";
   }
   return "In Progress";
+}
+
+function hasMergedPullRequestForEveryExpectedRepository(
+  snapshot: TaskSnapshot,
+): boolean {
+  if (snapshot.pullRequests.length === 0) return false;
+  const expectedRepositories = snapshot.expectedRepositories;
+  if (expectedRepositories.length === 0) {
+    return snapshot.pullRequests.every((pullRequest) => pullRequest.state === "merged");
+  }
+
+  const mergedRepositories = new Set(
+    snapshot.pullRequests
+      .filter((pullRequest) => pullRequest.state === "merged")
+      .flatMap((pullRequest) =>
+        pullRequest.repository ? [repositoryName(pullRequest.repository)] : [],
+      ),
+  );
+  return expectedRepositories.every((repository) =>
+    mergedRepositories.has(repositoryName(repository)),
+  );
+}
+
+function repositoryName(repository: string): string {
+  return repository.trim().toLowerCase().split("/").at(-1) ?? "";
 }

@@ -65,14 +65,28 @@ beforeEach(async () => {
         last_sync_error TEXT
       )`),
     env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS progress_notes (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS progress_notes (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
         kind TEXT NOT NULL,
         summary TEXT NOT NULL,
         evidence_url TEXT,
-        created_at TEXT NOT NULL
+      created_at TEXT NOT NULL
+    )`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS pull_requests (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        pr_url TEXT NOT NULL,
+        state TEXT NOT NULL,
+        review_state TEXT NOT NULL,
+        ci_state TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       )`),
+    env.DB.prepare("DELETE FROM pull_requests"),
     env.DB.prepare("DELETE FROM progress_notes"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);

@@ -5,5 +5,16 @@
     "Aragornnnnnn/landit-ai",
     "Aragornnnnnn/landit-iac",
     "Aragornnnnnn/landit-fe"
-  ]
+  ],
+  "verificationWorkflow": "proofops-verify.yml",
+  "statusMapping": {
+    "In Progress": "In Progress",
+    "In Review": "In Review",
+    "Changes Requested": "Changes Requested",
+    "Blocked": "Blocked",
+    "Deploying": "Deploying",
+    "Verifying": "Verifying",
+    "Done": "Done",
+    "Failed": "Failed"
+  }
 }

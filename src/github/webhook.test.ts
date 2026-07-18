@@ -21,6 +21,7 @@ const currentPullRequest: LinkedPullRequestSnapshot = {
 };
 const currentTaskSnapshot: TaskSnapshot = {
   started: true,
+  expectedRepositories: ["landit-be"],
   pullRequests: [currentPullRequest],
   deployment: "none",
   requiredVerification: "pending",
@@ -308,6 +309,31 @@ describe("handleGitHubWebhook", () => {
       technical_status: "Blocked",
       last_sync_error: "NOTION_SYNC_FAILED",
     });
+  });
+
+  it("다음 Webhook은 계산된 상태가 같아도 Notion 동기화를 재시도한다", async () => {
+    await insertTaskAndPullRequest();
+    const github = githubStub();
+    notionStub.updateTechnicalStatus.mockRejectedValueOnce(
+      new Error("temporary Notion failure"),
+    );
+
+    await handleGitHubWebhook(
+      await webhookRequest("pull_request", "delivery-notion-retry-1", pullRequestOpened),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+    await handleGitHubWebhook(
+      await webhookRequest("pull_request", "delivery-notion-retry-2", pullRequestOpened),
+      { db: env.DB, webhookSecret: secret, github, notion: notionStub },
+    );
+
+    expect(notionStub.updateTechnicalStatus).toHaveBeenCalledTimes(2);
+    await expect(
+      env.DB
+        .prepare("SELECT technical_status, last_sync_error FROM tasks WHERE id = ?")
+        .bind("task-1")
+        .first(),
+    ).resolves.toEqual({ technical_status: "Blocked", last_sync_error: null });
   });
 
   it("PR이 없는 workflow_run은 Task 7까지 ignored로 처리한다", async () => {

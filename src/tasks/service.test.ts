@@ -26,6 +26,7 @@ const task: TaskRecord = {
 
 const context: TaskContext = {
   ...task,
+  missingRepositories: [],
 };
 
 function createTasks(): TaskRepository {
@@ -70,5 +71,37 @@ describe("TaskService", () => {
       task.id,
       expect.stringContaining(token),
     );
+  });
+
+  it("기존 Notion 상태 이름과 무관하게 adapter 상태 매핑으로 동기화한다", async () => {
+    const tasks = createTasks();
+    const notion = createNotion();
+    vi.mocked(notion.getIssue).mockResolvedValue({
+      ...issue,
+      currentTechnicalStatus: "기존 사용자 정의 상태",
+    });
+
+    await new TaskService(tasks, notion).startTask(issue.pageId);
+
+    expect(notion.updateTechnicalStatus).toHaveBeenCalledWith(issue.pageId, "In Progress");
+  });
+
+  it("상태 조회는 동일한 재조정 경로를 거쳐 계산된 상태를 반환한다", async () => {
+    const tasks = createTasks();
+    const notion = createNotion();
+    const calculatedContext: TaskContext = {
+      ...context,
+      technicalStatus: "Blocked",
+      lastSyncError: "NOTION_SYNC_FAILED",
+      missingRepositories: ["landit-ai"],
+    };
+    vi.mocked(tasks.getContext).mockResolvedValue(calculatedContext);
+    const reconcile = vi.fn().mockResolvedValue(undefined);
+
+    await expect(new TaskService(tasks, notion, reconcile).getTaskStatus(task.id)).resolves.toMatchObject({
+      technicalStatus: "Blocked",
+      missingRepositories: ["landit-ai"],
+    });
+    expect(reconcile).toHaveBeenCalledWith(task.id);
   });
 });

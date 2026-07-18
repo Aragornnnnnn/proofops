@@ -124,14 +124,28 @@ export class GitHubAppClient implements GitHubPort {
 
   async getTaskSnapshot(taskId: string): Promise<TaskSnapshot> {
     const rows = await this.db
-      .prepare("SELECT pr_url FROM pull_requests WHERE task_id = ? ORDER BY pr_url")
+      .prepare("SELECT repository, pr_url FROM pull_requests WHERE task_id = ? ORDER BY updated_at DESC, pr_number DESC")
       .bind(taskId)
-      .all<{ pr_url: string }>();
+      .all<{ repository: string; pr_url: string }>();
+    const task = await this.db
+      .prepare("SELECT expected_repositories FROM tasks WHERE id = ?")
+      .bind(taskId)
+      .first<{ expected_repositories: string }>();
+    if (!task) throw new Error("TASK_NOT_FOUND");
+    const expectedRepositories = JSON.parse(task.expected_repositories) as string[];
+    const expectedNames = new Set(expectedRepositories.map(repositoryName));
+    const latestPullRequestUrls = new Map<string, string>();
+    for (const row of rows.results) {
+      const name = repositoryName(row.repository);
+      if (expectedNames.size > 0 && !expectedNames.has(name)) continue;
+      if (!latestPullRequestUrls.has(name)) latestPullRequestUrls.set(name, row.pr_url);
+    }
     const pullRequests = await Promise.all(
-      rows.results.map((row) => this.getPullRequest(row.pr_url)),
+      [...latestPullRequestUrls.values()].map((prUrl) => this.getPullRequest(prUrl)),
     );
     return {
       started: true,
+      expectedRepositories,
       pullRequests,
       deployment: "none",
       requiredVerification: "pending",
@@ -156,6 +170,10 @@ export class GitHubAppClient implements GitHubPort {
     if (!response.ok) throw new Error("GITHUB_API_FAILED");
     return (await response.json()) as T;
   }
+}
+
+function repositoryName(repository: string): string {
+  return repository.trim().toLowerCase().split("/").at(-1) ?? "";
 }
 
 export function createGitHubClient(

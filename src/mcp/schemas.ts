@@ -40,6 +40,7 @@ export const taskContextSchema = z.object({
   title: z.string(),
   technicalStatus: technicalStatusSchema,
   expectedRepositories: z.array(z.string()),
+  missingRepositories: z.array(z.string()),
   lastSyncError: z.string().nullable(),
 });
 

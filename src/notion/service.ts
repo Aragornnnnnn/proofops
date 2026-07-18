@@ -20,6 +20,6 @@ export interface CreateIssueInput {
 
 export interface NotionPort {
   getIssue(pageIdOrUrl: string): Promise<NotionIssue>;
-  updateTechnicalStatus(pageId: string, status: TechnicalStatus): Promise<void>;
+  updateTechnicalStatus(pageId: string, status: string): Promise<void>;
   createIssue(input: CreateIssueInput): Promise<NotionIssue>;
 }

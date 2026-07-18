@@ -168,4 +168,45 @@ describe("D1 작업 연결 저장소", () => {
       }),
     ).resolves.toBe(false);
   });
+
+  it("예상 저장소 순서대로 연결되지 않은 저장소를 반환한다", async () => {
+    await createTask(env.DB, {
+      id: "task-1",
+      notionPageId: "notion-page-1",
+      notionUrl: "https://notion.so/task-1",
+      title: "다중 저장소 상태 계산",
+      technicalStatus: "In Progress",
+      expectedRepositories: ["landit-ai", "landit-be", "landit-iac"],
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-be-old",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 10,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+      state: "merged",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "be-old",
+      updatedAt: createdAt,
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-ai",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-ai",
+      prNumber: 20,
+      prUrl: "https://github.com/Aragornnnnnn/landit-ai/pull/20",
+      state: "open",
+      reviewState: "pending",
+      ciState: "pending",
+      headSha: "ai-current",
+      updatedAt: "2026-07-18T00:10:00.000Z",
+    });
+
+    await expect(new D1TaskRepository(env.DB).getContext("task-1")).resolves.toMatchObject({
+      missingRepositories: ["landit-iac"],
+    });
+  });
 });

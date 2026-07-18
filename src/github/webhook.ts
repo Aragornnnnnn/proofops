@@ -1,5 +1,6 @@
 // 유효한 GitHub Webhook을 멱등하게 반영하고 작업 기술 상태를 재계산한다
 import { deriveTechnicalStatus } from "../domain/task-status";
+import { mapTechnicalStatusForNotion } from "../tasks/service";
 import type { NotionPort } from "../notion/service";
 import type { TaskContext } from "../tasks/repository";
 import {
@@ -159,7 +160,7 @@ async function persistPullRequest(
   });
 }
 
-async function reconcileTask(
+export async function reconcileTask(
   dependencies: LinkPullRequestDependencies,
   taskId: string,
 ): Promise<void> {
@@ -169,15 +170,20 @@ async function reconcileTask(
     .prepare("SELECT notion_page_id, technical_status FROM tasks WHERE id = ?")
     .bind(taskId)
     .first<{ notion_page_id: string; technical_status: string }>();
-  if (!task || task.technical_status === technicalStatus) return;
+  if (!task) return;
 
   const now = dependencies.now ?? (() => new Date().toISOString());
-  await dependencies.db
-    .prepare("UPDATE tasks SET technical_status = ?, updated_at = ? WHERE id = ?")
-    .bind(technicalStatus, now(), taskId)
-    .run();
+  if (task.technical_status !== technicalStatus) {
+    await dependencies.db
+      .prepare("UPDATE tasks SET technical_status = ?, updated_at = ? WHERE id = ?")
+      .bind(technicalStatus, now(), taskId)
+      .run();
+  }
   try {
-    await dependencies.notion.updateTechnicalStatus(task.notion_page_id, technicalStatus);
+    await dependencies.notion.updateTechnicalStatus(
+      task.notion_page_id,
+      mapTechnicalStatusForNotion(technicalStatus),
+    );
     await dependencies.db
       .prepare("UPDATE tasks SET last_sync_error = NULL, updated_at = ? WHERE id = ?")
       .bind(now(), taskId)
