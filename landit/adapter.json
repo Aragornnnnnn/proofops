@@ -3,7 +3,8 @@
   "allowedRepositories": [
     "Aragornnnnnn/landit-be",
     "Aragornnnnnn/landit-ai",
-    "Aragornnnnnn/landit-iac"
+    "Aragornnnnnn/landit-iac",
+    "Aragornnnnnn/proofops-sandbox"
   ],
   "verificationWorkflow": "proofops-verify.yml",
   "verificationRef": "main",
