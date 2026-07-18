@@ -1,7 +1,7 @@
 // Notion 작업 시작과 동기화 실패 격리를 검증한다
 import { describe, expect, it, vi } from "vitest";
 import type { NotionIssue, NotionPort } from "../notion/service";
-import type { TaskContext, TaskRecord, TaskRepository } from "./repository";
+import type { SharedTaskContext, TaskContext, TaskRecord, TaskRepository } from "./repository";
 import { TaskService } from "./service";
 
 const issue: NotionIssue = {
@@ -35,6 +35,12 @@ function createTasks(): TaskRepository {
     clearSyncError: vi.fn().mockResolvedValue(undefined),
     recordSyncError: vi.fn().mockResolvedValue(undefined),
     getContext: vi.fn().mockResolvedValue(context),
+    getSharedContext: vi.fn().mockResolvedValue({
+      ...context,
+      pullRequests: [],
+      progress: [],
+      verification: [],
+    } satisfies SharedTaskContext),
   };
 }
 
@@ -103,5 +109,84 @@ describe("TaskService", () => {
       missingRepositories: ["landit-ai"],
     });
     expect(reconcile).toHaveBeenCalledWith(task.id);
+  });
+
+  it("저장된 증거로 결정적인 인수인계를 만들고 추측성 진행 메모는 확정 사실로 올리지 않는다", async () => {
+    const tasks = createTasks();
+    const notion = createNotion();
+    vi.mocked(tasks.getSharedContext).mockResolvedValue({
+      ...context,
+      missingRepositories: ["landit-ai"],
+      lastSyncError: "NOTION_SYNC_FAILED",
+      pullRequests: [
+        {
+          url: "https://github.com/landit/landit-ai/pull/4",
+          repository: "landit/landit-ai",
+          state: "open",
+          reviewState: "changes_requested",
+          ciState: "failed",
+        },
+        {
+          url: "https://github.com/landit/landit-be/pull/3",
+          repository: "landit/landit-be",
+          state: "merged",
+          reviewState: "approved",
+          ciState: "passed",
+        },
+      ],
+      progress: [
+        { id: "test-1", taskId: task.id, kind: "test", summary: "unit test failed", evidenceUrl: null, createdAt: "2026-07-18T01:00:00.000Z" },
+        { id: "chat-1", taskId: task.id, kind: "decision", summary: "AI가 원인은 캐시라고 추측함", evidenceUrl: null, createdAt: "2026-07-18T02:00:00.000Z" },
+        { id: "block-1", taskId: task.id, kind: "blocker", summary: "배포 권한 대기", evidenceUrl: null, createdAt: "2026-07-18T03:00:00.000Z" },
+      ],
+      verification: [
+        {
+          repository: "landit/landit-ai",
+          environment: "develop",
+          status: "failed",
+          evidenceUrl: "https://github.com/landit/landit-ai/actions/runs/1",
+          checks: "api: failed",
+        },
+        {
+          repository: "landit/landit-be",
+          environment: "develop",
+          status: "pending",
+          evidenceUrl: null,
+          checks: "pending",
+        },
+      ],
+    });
+
+    await expect(new TaskService(tasks, notion, undefined, () => "2026-07-18T04:00:00.000Z").createHandoff(task.id)).resolves.toEqual({
+      requirement: {
+        title: issue.title,
+        url: issue.url,
+        acceptanceCriteria: issue.acceptanceCriteria,
+      },
+      confirmedFacts: [
+        "Pull request https://github.com/landit/landit-ai/pull/4 is open with changes_requested review and failed checks.",
+        "Pull request https://github.com/landit/landit-be/pull/3 is merged with approved review and passed checks.",
+        "Verification for landit/landit-ai in develop failed.",
+        "Verification for landit/landit-be in develop is pending.",
+      ],
+      pullRequests: [
+        { url: "https://github.com/landit/landit-ai/pull/4", repository: "landit/landit-ai", state: "open", checks: "changes_requested; failed" },
+        { url: "https://github.com/landit/landit-be/pull/3", repository: "landit/landit-be", state: "merged", checks: "approved; passed" },
+      ],
+      tests: [{ id: "test-1", taskId: task.id, kind: "test", summary: "unit test failed", evidenceUrl: null, createdAt: "2026-07-18T01:00:00.000Z" }],
+      deploymentAndVerification: [
+        { repository: "landit/landit-ai", environment: "develop", status: "failed", evidenceUrl: "https://github.com/landit/landit-ai/actions/runs/1", checks: "api: failed" },
+        { repository: "landit/landit-be", environment: "develop", status: "pending", evidenceUrl: null, checks: "pending" },
+      ],
+      blockers: ["배포 권한 대기", "NOTION_SYNC_FAILED"],
+      nextActions: [
+        "Address requested changes in https://github.com/landit/landit-ai/pull/4.",
+        "Fix failed checks for landit/landit-ai.",
+        "Link pull request for landit-ai.",
+        "Retry Notion synchronization.",
+        "Wait for verification for landit/landit-be.",
+      ],
+      generatedAt: "2026-07-18T04:00:00.000Z",
+    });
   });
 });

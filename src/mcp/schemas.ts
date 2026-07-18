@@ -29,6 +29,15 @@ export const getTaskStatusInputSchema = z.object({
   taskId: z.string().trim().min(1),
 });
 
+export const getContextInputSchema = z.object({
+  taskId: z.string().trim().min(1),
+  include: z.array(z.enum(["requirements", "pull_requests", "verification", "progress"])).min(1),
+});
+
+export const createHandoffInputSchema = z.object({
+  taskId: z.string().trim().min(1),
+});
+
 export const recordProgressInputSchema = z.object({
   taskId: z.string().trim().min(1),
   kind: z.enum(["test", "blocker", "decision"]),
@@ -96,6 +105,53 @@ export const verificationDispatchSchema = z.object({
   requestId: z.string().uuid(),
   workflowRunUrl: z.string().url(),
   status: z.string(),
+});
+
+const pullRequestSummarySchema = z.object({
+  url: z.string().url(),
+  repository: z.string(),
+  state: z.string(),
+  reviewState: z.string(),
+  ciState: z.string(),
+});
+
+export const sharedTaskContextSchema = taskContextSchema.extend({
+  pullRequests: z.array(pullRequestSummarySchema),
+  progress: z.array(progressNoteSchema),
+  verification: z.array(
+    z.object({
+      repository: z.string(),
+      environment: z.string(),
+      status: z.string(),
+      evidenceUrl: z.string().nullable(),
+      checks: z.string(),
+    }),
+  ),
+});
+
+export const handoffSchema = z.object({
+  requirement: z.object({
+    title: z.string(),
+    url: z.string().url(),
+    acceptanceCriteria: z.array(z.string()),
+  }),
+  confirmedFacts: z.array(z.string()),
+  pullRequests: z.array(
+    z.object({ url: z.string().url(), repository: z.string(), state: z.string(), checks: z.string() }),
+  ),
+  tests: z.array(progressNoteSchema),
+  deploymentAndVerification: z.array(
+    z.object({
+      repository: z.string(),
+      environment: z.string(),
+      status: z.string(),
+      evidenceUrl: z.string().nullable(),
+      checks: z.string(),
+    }),
+  ),
+  blockers: z.array(z.string()),
+  nextActions: z.array(z.string()),
+  generatedAt: z.string(),
 });
 
 export const incidentEvidenceSchema = z.object({

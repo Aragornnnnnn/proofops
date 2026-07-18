@@ -640,7 +640,7 @@ describe("POST /mcp", () => {
     ).resolves.toEqual({ count: 0 });
   });
 
-  it("초기화 후 정확히 일곱 MCP 도구를 공개한다", async () => {
+  it("초기화 후 정확히 아홉 MCP 도구를 공개한다", async () => {
     const sessionId = await initializeMcp();
 
     const toolsResponse = await postMcp(
@@ -656,6 +656,8 @@ describe("POST /mcp", () => {
       result: {
         tools: [
           { name: "start_task" },
+          { name: "get_context" },
+          { name: "create_handoff" },
           { name: "link_pull_request" },
           { name: "get_task_status" },
           { name: "record_progress" },
@@ -665,7 +667,7 @@ describe("POST /mcp", () => {
         ],
       },
     });
-    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(7);
+    expect((tools.result as { tools: unknown[] }).tools).toHaveLength(9);
   });
 
   it("일곱 도구가 안정된 오류 코드로 실패를 반환한다", async () => {

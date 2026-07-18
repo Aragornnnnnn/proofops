@@ -16,11 +16,43 @@ export interface TaskContext extends TaskRecord {
   missingRepositories: string[];
 }
 
+export interface ProgressNote {
+  id: string;
+  taskId: string;
+  kind: "test" | "blocker" | "decision";
+  summary: string;
+  evidenceUrl: string | null;
+  createdAt: string;
+}
+
+export interface PullRequestSummary {
+  url: string;
+  repository: string;
+  state: string;
+  reviewState: string;
+  ciState: string;
+}
+
+export interface VerificationSummary {
+  repository: string;
+  environment: string;
+  status: string;
+  evidenceUrl: string | null;
+  checks: string;
+}
+
+export interface SharedTaskContext extends TaskContext {
+  pullRequests: PullRequestSummary[];
+  progress: ProgressNote[];
+  verification: VerificationSummary[];
+}
+
 export interface TaskRepository {
   upsertFromNotion(issue: NotionIssue): Promise<TaskRecord>;
   clearSyncError(taskId: string): Promise<void>;
   recordSyncError(taskId: string, message: string): Promise<void>;
   getContext(taskId: string): Promise<TaskContext>;
+  getSharedContext(taskId: string): Promise<SharedTaskContext>;
 }
 
 export interface CreateTaskInput {
@@ -199,6 +231,61 @@ export class D1TaskRepository implements TaskRepository {
     };
   }
 
+  async getSharedContext(taskId: string): Promise<SharedTaskContext> {
+    const context = await this.getContext(taskId);
+    const [pullRequests, progress, verification] = await Promise.all([
+      this.db
+        .prepare(
+          `SELECT pr_url, repository, state, review_state, ci_state
+           FROM pull_requests WHERE task_id = ?
+           ORDER BY lower(repository), pr_number`,
+        )
+        .bind(taskId)
+        .all<PullRequestRow>(),
+      this.db
+        .prepare(
+          `SELECT id, task_id, kind, summary, evidence_url, created_at
+           FROM progress_notes WHERE task_id = ?
+           ORDER BY created_at, id`,
+        )
+        .bind(taskId)
+        .all<ProgressNoteRow>(),
+      this.db
+        .prepare(
+          `SELECT repository, environment, status, evidence_url, result_json
+           FROM verification_runs WHERE task_id = ?
+           ORDER BY lower(repository), environment, created_at, id`,
+        )
+        .bind(taskId)
+        .all<VerificationRow>(),
+    ]);
+    return {
+      ...context,
+      pullRequests: pullRequests.results.map((row) => ({
+        url: row.pr_url,
+        repository: row.repository,
+        state: row.state,
+        reviewState: row.review_state,
+        ciState: row.ci_state,
+      })),
+      progress: progress.results.map((row) => ({
+        id: row.id,
+        taskId: row.task_id,
+        kind: row.kind as ProgressNote["kind"],
+        summary: row.summary,
+        evidenceUrl: row.evidence_url,
+        createdAt: row.created_at,
+      })),
+      verification: verification.results.map((row) => ({
+        repository: row.repository,
+        environment: row.environment,
+        status: row.status,
+        evidenceUrl: row.evidence_url,
+        checks: verificationChecks(row.result_json, row.status),
+      })),
+    };
+  }
+
   private async findByNotionPageId(pageId: string): Promise<TaskRecord | null> {
     const task = await this.db
       .prepare(`SELECT id, notion_page_id, notion_url, title, technical_status,
@@ -223,6 +310,31 @@ interface TaskRow {
   last_sync_error: string | null;
 }
 
+interface PullRequestRow {
+  pr_url: string;
+  repository: string;
+  state: string;
+  review_state: string;
+  ci_state: string;
+}
+
+interface ProgressNoteRow {
+  id: string;
+  task_id: string;
+  kind: string;
+  summary: string;
+  evidence_url: string | null;
+  created_at: string;
+}
+
+interface VerificationRow {
+  repository: string;
+  environment: string;
+  status: string;
+  evidence_url: string | null;
+  result_json: string;
+}
+
 function toTaskRecord(row: TaskRow): TaskRecord {
   return {
     id: row.id,
@@ -233,4 +345,16 @@ function toTaskRecord(row: TaskRow): TaskRecord {
     expectedRepositories: JSON.parse(row.expected_repositories) as string[],
     lastSyncError: row.last_sync_error,
   };
+}
+
+function verificationChecks(resultJson: string, fallback: string): string {
+  try {
+    const result = JSON.parse(resultJson) as { checks?: Array<{ name?: string; status?: string }> };
+    const checks = result.checks
+      ?.filter((check) => check.name && check.status)
+      .map((check) => `${check.name}: ${check.status}`);
+    return checks?.join(", ") || fallback;
+  } catch {
+    return fallback;
+  }
 }

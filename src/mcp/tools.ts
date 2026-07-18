@@ -12,11 +12,13 @@ import { createNotionClient } from "../notion/client";
 import type { CreateIssueInput, NotionIssue, NotionPort } from "../notion/service";
 import { createSentryClient, type SentryPort } from "../sentry/client";
 import type { IncidentEvidence } from "../sentry/mapper";
-import type { TaskContext } from "../tasks/repository";
+import type { ProgressNote, SharedTaskContext, TaskContext } from "../tasks/repository";
 import { D1TaskRepository, prepareUpsertPullRequest } from "../tasks/repository";
-import { mapTechnicalStatusForNotion, TaskService } from "../tasks/service";
+import { mapTechnicalStatusForNotion, type Handoff, TaskService } from "../tasks/service";
 import {
   getTaskStatusInputSchema,
+  getContextInputSchema,
+  createHandoffInputSchema,
   createNotionIssueInputSchema,
   incidentEvidenceSchema,
   investigateIncidentInputSchema,
@@ -27,17 +29,12 @@ import {
   startTaskInputSchema,
   linkPullRequestInputSchema,
   taskContextSchema,
+  sharedTaskContextSchema,
+  handoffSchema,
   verificationDispatchSchema,
 } from "./schemas";
 
-export interface ProgressNote {
-  id: string;
-  taskId: string;
-  kind: "test" | "blocker" | "decision";
-  summary: string;
-  evidenceUrl: string | null;
-  createdAt: string;
-}
+export type { ProgressNote } from "../tasks/repository";
 
 export interface ProofOpsTools {
   startTask(input: { operationId: string; notionPageIdOrUrl: string }): Promise<TaskContext>;
@@ -47,6 +44,11 @@ export interface ProofOpsTools {
     pullRequestUrl: string;
   }): Promise<TaskContext>;
   getTaskStatus(input: { taskId: string }): Promise<TaskContext>;
+  getContext(input: {
+    taskId: string;
+    include: Array<"requirements" | "pull_requests" | "verification" | "progress">;
+  }): Promise<SharedTaskContext>;
+  createHandoff(input: { taskId: string }): Promise<Handoff>;
   recordProgress(input: {
     taskId: string;
     kind: ProgressNote["kind"];
@@ -191,6 +193,8 @@ export function createProofOpsTools(
       return tasks.getContext(linkInput.taskId);
     },
     getTaskStatus: ({ taskId }) => taskService.getTaskStatus(taskId),
+    getContext: ({ taskId }) => taskService.getContext(taskId),
+    createHandoff: ({ taskId }) => taskService.createHandoff(taskId),
     async recordProgress({ taskId, kind, summary, evidenceUrl }) {
       await tasks.getContext(taskId);
 
@@ -623,6 +627,30 @@ export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): 
     },
   );
   server.registerTool(
+    "get_context",
+    {
+      description: "ProofOps 작업의 저장된 공용 컨텍스트를 조회한다.",
+      inputSchema: mcpGetContextInputSchema,
+      outputSchema: sharedTaskContextSchema,
+    },
+    async (input) => {
+      const parsed = getContextInputSchema.safeParse(input);
+      return parsed.success ? toToolResult(() => tools.getContext(parsed.data)) : inputInvalidResult();
+    },
+  );
+  server.registerTool(
+    "create_handoff",
+    {
+      description: "저장된 작업 증거에서 결정적인 인수인계를 만든다.",
+      inputSchema: mcpCreateHandoffInputSchema,
+      outputSchema: handoffSchema,
+    },
+    async (input) => {
+      const parsed = createHandoffInputSchema.safeParse(input);
+      return parsed.success ? toToolResult(() => tools.createHandoff(parsed.data)) : inputInvalidResult();
+    },
+  );
+  server.registerTool(
     "link_pull_request",
     {
       description: "허용된 GitHub Pull Request를 ProofOps 작업에 연결한다.",
@@ -716,6 +744,15 @@ const mcpStartTaskInputSchema = z.object({
 });
 
 const mcpGetTaskStatusInputSchema = z.object({
+  taskId: z.string().catch(""),
+});
+
+const mcpGetContextInputSchema = z.object({
+  taskId: z.string().catch(""),
+  include: z.array(z.string().catch("")).catch([]),
+});
+
+const mcpCreateHandoffInputSchema = z.object({
   taskId: z.string().catch(""),
 });
 
