@@ -124,15 +124,19 @@ async function renderConsent(
   try {
     return await SELF.fetch(
       `https://proofops.test/oauth/callback?code=github-code&state=${encodeURIComponent(fixture.githubState)}`,
+      { redirect: "manual" },
     );
   } finally {
     vi.stubGlobal("fetch", previousFetch);
   }
 }
 
-async function approvedAccessToken(): Promise<string> {
+async function approvedAccessToken(
+  profile: { id: number; login: string } = { id: 101, login: "Alice" },
+  tokenScope?: string,
+): Promise<string> {
   const fixture = await beginAuthorization();
-  const consent = await renderConsent(fixture);
+  const consent = await renderConsent(fixture, profile);
   expect(consent.status).toBe(200);
   const form = parseConsentForm(await consent.text());
   const approved = await submitConsent(form, "approve");
@@ -148,6 +152,7 @@ async function approvedAccessToken(): Promise<string> {
       code,
       redirect_uri: fixture.downstreamRedirectUri,
       code_verifier: fixture.verifier,
+      ...(tokenScope === undefined ? {} : { scope: tokenScope }),
     }),
   });
   expect(token.status).toBe(200);
@@ -266,7 +271,22 @@ beforeEach(async () => {
         action TEXT NOT NULL,
         resource_type TEXT NOT NULL,
         resource_id TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'succeeded',
+        idempotency_key TEXT,
+        updated_at TEXT,
+        error_code TEXT
+      )`),
+    env.DB.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_key_idx
+      ON audit_events(idempotency_key) WHERE idempotency_key IS NOT NULL`),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS mcp_sessions (
+        session_id TEXT PRIMARY KEY,
+        actor_github_user_id INTEGER NOT NULL,
+        actor_github_login TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
       )`),
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS pull_requests (
@@ -286,6 +306,7 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM progress_notes"),
     env.DB.prepare("DELETE FROM oauth_ephemeral_states"),
     env.DB.prepare("DELETE FROM audit_events"),
+    env.DB.prepare("DELETE FROM mcp_sessions"),
     env.DB.prepare("DELETE FROM tasks"),
   ]);
 });
@@ -338,14 +359,17 @@ describe("GitHub OAuth consent", () => {
     expect(after.keys).toHaveLength(before.keys.length);
   });
 
-  it("allowlist에 없는 GitHub 사용자는 동의 화면 전에 거부한다", async () => {
+  it("allowlist에 없는 GitHub 사용자를 callback state를 보존해 거부한다", async () => {
     const fixture = await beginAuthorization();
     const response = await renderConsent(fixture, { id: 404, login: "mallory" });
 
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(302);
+    const redirect = new URL(requiredHeader(response, "location"));
+    expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.get("state")).toBe("downstream-state");
   });
 
-  it("지원하지 않는 추가 scope는 GitHub 인증 전에 거부한다", async () => {
+  it("지원하지 않는 추가 scope를 callback state를 보존해 거부한다", async () => {
     const redirectUri = "https://client.example/oauth/callback";
     const clientId = await registerOAuthClient(redirectUri);
     const url = await authorizationUrl(
@@ -355,10 +379,64 @@ describe("GitHub OAuth consent", () => {
       "mcp admin",
     );
 
-    const response = await SELF.fetch(url);
+    const response = await SELF.fetch(url, { redirect: "manual" });
 
-    expect(response.status).toBe(400);
-    await expect(response.text()).resolves.toContain("invalid_scope");
+    expect(response.status).toBe(302);
+    const redirect = new URL(requiredHeader(response, "location"));
+    expect(redirect.searchParams.get("error")).toBe("invalid_scope");
+    expect(redirect.searchParams.get("state")).toBe("downstream-state");
+  });
+
+  it("지원하지 않는 response type을 callback state를 보존해 거부한다", async () => {
+    const redirectUri = "https://client.example/oauth/callback";
+    const clientId = await registerOAuthClient(redirectUri);
+    const url = await authorizationUrl(
+      clientId,
+      redirectUri,
+      "proofops-test-verifier-abcdefghijklmnopqrstuvwxyz123456",
+      "mcp",
+    );
+    url.searchParams.set("response_type", "token");
+
+    const response = await SELF.fetch(url, { redirect: "manual" });
+
+    expect(response.status).toBe(302);
+    const redirect = new URL(requiredHeader(response, "location"));
+    expect(redirect.searchParams.get("error")).toBe("invalid_request");
+    expect(redirect.searchParams.get("state")).toBe("downstream-state");
+  });
+
+  it("GitHub가 인증을 거절하면 access_denied와 callback state를 반환한다", async () => {
+    const fixture = await beginAuthorization();
+
+    const response = await SELF.fetch(
+      `https://proofops.test/oauth/callback?error=access_denied&state=${encodeURIComponent(fixture.githubState)}`,
+      { redirect: "manual" },
+    );
+
+    expect(response.status).toBe(302);
+    const redirect = new URL(requiredHeader(response, "location"));
+    expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.get("state")).toBe("downstream-state");
+  });
+
+  it("GitHub token 교환 실패는 server_error와 callback state를 반환한다", async () => {
+    const fixture = await beginAuthorization();
+    const previousFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("failed", { status: 502 })));
+    try {
+      const response = await SELF.fetch(
+        `https://proofops.test/oauth/callback?code=github-code&state=${encodeURIComponent(fixture.githubState)}`,
+        { redirect: "manual" },
+      );
+
+      expect(response.status).toBe(302);
+      const redirect = new URL(requiredHeader(response, "location"));
+      expect(redirect.searchParams.get("error")).toBe("server_error");
+      expect(redirect.searchParams.get("state")).toBe("downstream-state");
+    } finally {
+      vi.stubGlobal("fetch", previousFetch);
+    }
   });
 
   it.each([
@@ -454,6 +532,7 @@ describe("GitHub OAuth consent", () => {
     expect(response.status).toBe(302);
     const redirect = new URL(requiredHeader(response, "location"));
     expect(redirect.searchParams.get("error")).toBe("access_denied");
+    expect(redirect.searchParams.get("state")).toBe("downstream-state");
     expect(redirect.searchParams.has("code")).toBe(false);
   });
 
@@ -494,6 +573,66 @@ describe("POST /mcp", () => {
 
     expect(response.status).toBe(401);
     expect(response.headers.get("www-authenticate")).toContain("Bearer");
+  });
+
+  it("mcp scope가 없는 실제 access token을 거부한다", async () => {
+    const downscopedToken = await approvedAccessToken(
+      { id: 101, login: "Alice" },
+      "unknown",
+    );
+
+    const response = await postMcp(
+      {
+        jsonrpc: "2.0",
+        id: "initialize",
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "proofops-test", version: "1.0.0" },
+        },
+      },
+      undefined,
+      downscopedToken,
+    );
+
+    expect(response.status).toBe(403);
+  });
+
+  it("다른 actor가 기존 MCP session을 재사용하지 못하게 한다", async () => {
+    const aliceToken = await approvedAccessToken({ id: 101, login: "Alice" });
+    const bobToken = await approvedAccessToken({ id: 202, login: "Bob" });
+    const sessionId = await initializeMcp(aliceToken);
+    const listRequest = { jsonrpc: "2.0", id: "tools", method: "tools/list", params: {} };
+
+    const bobResponse = await postMcp(listRequest, sessionId, bobToken);
+    const aliceResponse = await postMcp(listRequest, sessionId, aliceToken);
+
+    expect(bobResponse.status).toBe(403);
+    expect(aliceResponse.status).toBe(200);
+  });
+
+  it("만료된 MCP session binding을 정리하고 거부한다", async () => {
+    const aliceToken = await approvedAccessToken({ id: 101, login: "Alice" });
+    const sessionId = await initializeMcp(aliceToken);
+    await env.DB
+      .prepare("UPDATE mcp_sessions SET expires_at = 0 WHERE session_id = ?")
+      .bind(sessionId)
+      .run();
+
+    const response = await postMcp(
+      { jsonrpc: "2.0", id: "tools", method: "tools/list", params: {} },
+      sessionId,
+      aliceToken,
+    );
+
+    expect(response.status).toBe(403);
+    await expect(
+      env.DB
+        .prepare("SELECT COUNT(*) AS count FROM mcp_sessions WHERE session_id = ?")
+        .bind(sessionId)
+        .first(),
+    ).resolves.toEqual({ count: 0 });
   });
 
   it("초기화 후 정확히 일곱 MCP 도구를 공개한다", async () => {
@@ -609,7 +748,9 @@ describe("POST /mcp", () => {
       });
     }
     await expect(
-      env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first(),
+      env.DB
+        .prepare("SELECT COUNT(*) AS count FROM audit_events WHERE status = 'succeeded'")
+        .first(),
     ).resolves.toEqual({ count: 0 });
   });
 

@@ -41,8 +41,15 @@ beforeEach(async () => {
         action TEXT NOT NULL,
         resource_type TEXT NOT NULL,
         resource_id TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'succeeded',
+        idempotency_key TEXT,
+        updated_at TEXT,
+        error_code TEXT
       )`),
+    env.DB.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_key_idx
+      ON audit_events(idempotency_key) WHERE idempotency_key IS NOT NULL`),
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS pull_requests (
         id TEXT PRIMARY KEY,
@@ -114,6 +121,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await env.DB.batch([
     env.DB.prepare("DROP TRIGGER IF EXISTS fail_dispatched_update"),
+    env.DB.prepare("DROP TRIGGER IF EXISTS fail_record_progress_audit"),
+    env.DB.prepare("DROP TRIGGER IF EXISTS fail_create_notion_terminal_audit"),
     env.DB.prepare("DELETE FROM verification_requests"),
     env.DB.prepare("DELETE FROM audit_events"),
     env.DB.prepare("DELETE FROM progress_notes"),
@@ -202,7 +211,7 @@ describe("mutation actor audit", () => {
 
     const events = await env.DB
       .prepare(
-        `SELECT actor_github_user_id, action, resource_type, resource_id
+        `SELECT actor_github_user_id, action, resource_type, resource_id, status
          FROM audit_events ORDER BY action`,
       )
       .all();
@@ -212,35 +221,40 @@ describe("mutation actor audit", () => {
         action: "create_notion_issue",
         resource_type: "notion_issue",
         resource_id: notionIssue.pageId,
+        status: "succeeded",
       },
       {
         actor_github_user_id: 101,
         action: "link_pull_request",
         resource_type: "task",
         resource_id: "task-1",
+        status: "succeeded",
       },
       {
         actor_github_user_id: 101,
         action: "record_progress",
         resource_type: "progress_note",
         resource_id: note.id,
+        status: "succeeded",
       },
       {
         actor_github_user_id: 101,
         action: "request_verification",
         resource_type: "verification_request",
         resource_id: verification.requestId,
+        status: "succeeded",
       },
       {
         actor_github_user_id: 101,
         action: "start_task",
         resource_type: "task",
         resource_id: started.id,
+        status: "succeeded",
       },
     ]);
   });
 
-  it("실패한 외부 API 호출은 성공 audit을 남기지 않는다", async () => {
+  it("side effect 여부가 불확실한 외부 API 오류는 pending으로 유지한다", async () => {
     const tools = createProofOpsTools(
       env,
       { githubUserId: 101, githubLogin: "alice" },
@@ -263,9 +277,192 @@ describe("mutation actor audit", () => {
         acceptanceCriteria: [],
       }),
     ).rejects.toThrow("NOTION_CREATE_FAILED");
+    await expect(env.DB.prepare(
+      "SELECT actor_github_user_id, action, status, error_code FROM audit_events",
+    ).first()).resolves.toEqual({
+      actor_github_user_id: 101,
+      action: "create_notion_issue",
+      status: "pending",
+      error_code: "NOTION_CREATE_FAILED",
+    });
+  });
+
+  it("mutation 전 읽기 실패만 failed_retryable로 기록하고 안전하게 재시도한다", async () => {
+    const issue = {
+      pageId: "notion-retryable",
+      url: "https://notion.so/notion-retryable",
+      title: "재시도 작업",
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const getIssue = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("NOTION_READ_FAILED"))
+      .mockResolvedValueOnce(issue);
+    const tools = createProofOpsTools(
+      env,
+      { githubUserId: 101, githubLogin: "alice" },
+      {
+        notion: {
+          getIssue,
+          updateTechnicalStatus: vi.fn().mockResolvedValue(undefined),
+          createIssue: vi.fn(),
+        },
+        github: {
+          getPullRequest: vi.fn(),
+          getTaskSnapshot: vi.fn().mockResolvedValue({
+            started: true,
+            expectedRepositories: [],
+            pullRequests: [],
+            deployment: "none",
+            requiredVerification: "pending",
+          }),
+          dispatchVerification: vi.fn(),
+          getVerificationArtifact: vi.fn(),
+        },
+      },
+    );
+    const input = { notionPageIdOrUrl: issue.pageId };
+
+    await expect(tools.startTask(input)).rejects.toThrow("NOTION_READ_FAILED");
     await expect(
-      env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first(),
+      env.DB.prepare("SELECT status FROM audit_events").first(),
+    ).resolves.toEqual({ status: "failed_retryable" });
+    await expect(tools.startTask(input)).resolves.toMatchObject({
+      notionPageId: issue.pageId,
+    });
+    expect(getIssue).toHaveBeenCalledTimes(2);
+    await expect(
+      env.DB.prepare("SELECT status FROM audit_events").first(),
+    ).resolves.toEqual({ status: "succeeded" });
+  });
+
+  it("record_progress note와 success audit을 하나의 D1 transaction으로 쓴다", async () => {
+    await env.DB
+      .prepare(
+        `CREATE TRIGGER fail_record_progress_audit
+         BEFORE INSERT ON audit_events
+         WHEN NEW.action = 'record_progress'
+         BEGIN
+           SELECT RAISE(ABORT, 'simulated audit insert failure');
+         END`,
+      )
+      .run();
+    const tools = createProofOpsTools(
+      env,
+      { githubUserId: 101, githubLogin: "alice" },
+    );
+
+    await expect(
+      tools.recordProgress({
+        taskId: "task-1",
+        kind: "test",
+        summary: "원자성 검증",
+      }),
+    ).rejects.toThrow("simulated audit insert failure");
+    await expect(
+      env.DB.prepare("SELECT COUNT(*) AS count FROM progress_notes").first(),
     ).resolves.toEqual({ count: 0 });
+  });
+
+  it("외부 성공 뒤 terminal audit 실패와 retry가 중복 생성을 막는다", async () => {
+    await env.DB
+      .prepare(
+        `CREATE TRIGGER fail_create_notion_terminal_audit
+         BEFORE UPDATE OF status ON audit_events
+         WHEN OLD.action = 'create_notion_issue' AND NEW.status = 'succeeded'
+         BEGIN
+           SELECT RAISE(ABORT, 'simulated terminal audit failure');
+         END`,
+      )
+      .run();
+    const createdIssue = {
+      pageId: "notion-created-once",
+      url: "https://notion.so/notion-created-once",
+      title: "한 번만 생성",
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const createIssue = vi.fn().mockResolvedValue(createdIssue);
+    const tools = createProofOpsTools(
+      env,
+      { githubUserId: 101, githubLogin: "alice" },
+      {
+        notion: {
+          getIssue: vi.fn(),
+          updateTechnicalStatus: vi.fn(),
+          createIssue,
+        },
+      },
+    );
+    const input = {
+      title: "중복 방지",
+      impact: "영향",
+      evidence: [],
+      causeOrHypothesis: "가설",
+      scope: [],
+      acceptanceCriteria: [],
+    };
+
+    await expect(tools.createNotionIssue(input)).rejects.toThrow(
+      "simulated terminal audit failure",
+    );
+    await expect(tools.createNotionIssue(input)).rejects.toThrow(
+      "OPERATION_PENDING",
+    );
+    expect(createIssue).toHaveBeenCalledTimes(1);
+    await expect(
+      env.DB.prepare("SELECT status FROM audit_events").first(),
+    ).resolves.toEqual({ status: "pending" });
+  });
+
+  it("succeeded operation 재시도는 저장한 resource를 복구하고 외부 생성을 반복하지 않는다", async () => {
+    const createdIssue = {
+      pageId: "notion-recovered",
+      url: "https://notion.so/notion-recovered",
+      title: "복구할 이슈",
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const createIssue = vi.fn().mockResolvedValue(createdIssue);
+    const getIssue = vi.fn().mockResolvedValue(createdIssue);
+    const tools = createProofOpsTools(
+      env,
+      { githubUserId: 101, githubLogin: "alice" },
+      {
+        notion: {
+          getIssue,
+          updateTechnicalStatus: vi.fn(),
+          createIssue,
+        },
+      },
+    );
+    const input = {
+      title: "성공 복구",
+      impact: "영향",
+      evidence: [],
+      causeOrHypothesis: "가설",
+      scope: [],
+      acceptanceCriteria: [],
+    };
+
+    await expect(tools.createNotionIssue(input)).resolves.toEqual(createdIssue);
+    await expect(tools.createNotionIssue(input)).resolves.toEqual(createdIssue);
+
+    expect(createIssue).toHaveBeenCalledTimes(1);
+    expect(getIssue).toHaveBeenCalledWith(createdIssue.pageId);
+    await expect(
+      env.DB.prepare("SELECT status, resource_id FROM audit_events").first(),
+    ).resolves.toEqual({
+      status: "succeeded",
+      resource_id: createdIssue.pageId,
+    });
   });
 });
 

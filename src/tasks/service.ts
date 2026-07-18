@@ -1,7 +1,7 @@
 // Notion 이슈를 ProofOps 작업 연결로 시작하는 응용 서비스를 제공한다
 import adapter from "../../landit/adapter.json";
 import type { TechnicalStatus } from "../domain/types";
-import type { NotionPort } from "../notion/service";
+import type { NotionIssue, NotionPort } from "../notion/service";
 import type { TaskContext, TaskRecord, TaskRepository } from "./repository";
 
 export class TaskService {
@@ -13,6 +13,10 @@ export class TaskService {
 
   async startTask(pageIdOrUrl: string): Promise<TaskContext> {
     const issue = await this.notion.getIssue(pageIdOrUrl);
+    return this.startTaskFromIssue(issue);
+  }
+
+  async startTaskFromIssue(issue: NotionIssue): Promise<TaskContext> {
     const task = await this.tasks.upsertFromNotion(issue);
     await this.syncTechnicalStatus(task);
     return this.tasks.getContext(task.id);

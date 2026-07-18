@@ -5,12 +5,14 @@ import initialMigration from "../migrations/0001_initial.sql?raw";
 import linkedAtMigration from "../migrations/0002_pull_request_linked_at.sql?raw";
 import verificationRequestsMigration from "../migrations/0003_verification_requests.sql?raw";
 import actorAuditMigration from "../migrations/0004_actor_audit.sql?raw";
+import reviewSecurityMigration from "../migrations/0005_review_security.sql?raw";
 
 const migrationFiles = [
   initialMigration,
   linkedAtMigration,
   verificationRequestsMigration,
   actorAuditMigration,
+  reviewSecurityMigration,
 ];
 
 async function resetDatabase(): Promise<void> {
@@ -21,6 +23,7 @@ async function resetDatabase(): Promise<void> {
     DROP TABLE IF EXISTS verification_requests;
     DROP TABLE IF EXISTS oauth_ephemeral_states;
     DROP TABLE IF EXISTS audit_events;
+    DROP TABLE IF EXISTS mcp_sessions;
     DROP TABLE IF EXISTS pull_requests;
     DROP TABLE IF EXISTS tasks;
   `);
@@ -90,5 +93,19 @@ describe("D1 마이그레이션 체인", () => {
       )
       .first<{ name: string }>();
     expect(auditTable).toEqual({ name: "audit_events" });
+
+    const sessionTable = await env.DB
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_sessions'",
+      )
+      .first<{ name: string }>();
+    expect(sessionTable).toEqual({ name: "mcp_sessions" });
+
+    const auditColumns = await env.DB
+      .prepare("PRAGMA table_info(audit_events)")
+      .all<{ name: string }>();
+    expect(auditColumns.results.map(({ name }) => name)).toEqual(
+      expect.arrayContaining(["status", "idempotency_key", "updated_at", "error_code"]),
+    );
   });
 });

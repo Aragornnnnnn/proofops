@@ -78,21 +78,64 @@ export function createProofOpsTools(
   const taskService = new TaskService(tasks, notion, (taskId) =>
     reconcileTask({ db: env.DB, github, notion }, taskId),
   );
-  const audit = (
-    action: MutationAction,
-    resourceType: MutationResourceType,
-    resourceId: string,
-  ) => recordAuditEvent(env.DB, actor, action, resourceType, resourceId);
 
   return {
     async startTask({ notionPageIdOrUrl }) {
-      const task = await taskService.startTask(notionPageIdOrUrl);
-      await audit("start_task", "task", task.id);
+      const operation = await beginOperation(
+        env.DB,
+        actor,
+        "start_task",
+        "task",
+        notionPageIdOrUrl,
+        { notionPageIdOrUrl },
+      );
+      if (!operation.execute) {
+        if (operation.record.status === "succeeded") {
+          return tasks.getContext(operation.record.resourceId);
+        }
+        throw new Error("OPERATION_PENDING");
+      }
+
+      let issue: NotionIssue;
+      try {
+        issue = await notion.getIssue(notionPageIdOrUrl);
+      } catch (error) {
+        await markRetryable(env.DB, operation.record.eventId, error);
+        throw error;
+      }
+      let task: TaskContext;
+      try {
+        task = await taskService.startTaskFromIssue(issue);
+      } catch (error) {
+        await markUncertain(env.DB, operation.record.eventId, error);
+        throw error;
+      }
+      await markSucceeded(env.DB, operation.record.eventId, task.id);
       return task;
     },
     async linkPullRequest(input) {
-      const task = await linkPullRequest(input, { db: env.DB, github, notion });
-      await audit("link_pull_request", "task", task.id);
+      const operation = await beginOperation(
+        env.DB,
+        actor,
+        "link_pull_request",
+        "task",
+        input.taskId,
+        input,
+      );
+      if (!operation.execute) {
+        if (operation.record.status === "succeeded") {
+          return tasks.getContext(operation.record.resourceId);
+        }
+        throw new Error("OPERATION_PENDING");
+      }
+      let task: TaskContext;
+      try {
+        task = await linkPullRequest(input, { db: env.DB, github, notion });
+      } catch (error) {
+        await markUncertain(env.DB, operation.record.eventId, error);
+        throw error;
+      }
+      await markSucceeded(env.DB, operation.record.eventId, task.id);
       return task;
     },
     getTaskStatus: ({ taskId }) => taskService.getTaskStatus(taskId),
@@ -107,8 +150,9 @@ export function createProofOpsTools(
         evidenceUrl: evidenceUrl ?? null,
         createdAt: new Date().toISOString(),
       };
-      await env.DB
-        .prepare(
+      const eventId = crypto.randomUUID();
+      await env.DB.batch([
+        env.DB.prepare(
           `INSERT INTO progress_notes (
              id, task_id, kind, summary, evidence_url, actor_github_user_id, created_at
            ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -121,20 +165,57 @@ export function createProofOpsTools(
           note.evidenceUrl,
           actor.githubUserId,
           note.createdAt,
-        )
-        .run();
-      await audit("record_progress", "progress_note", note.id);
+        ),
+        env.DB
+          .prepare(
+            `INSERT INTO audit_events (
+               event_id, actor_github_user_id, action, resource_type, resource_id,
+               created_at, status, idempotency_key, updated_at, error_code
+             ) VALUES (?, ?, 'record_progress', 'progress_note', ?, ?, 'succeeded', NULL, ?, NULL)`,
+          )
+          .bind(eventId, actor.githubUserId, note.id, note.createdAt, note.createdAt),
+      ]);
       return note;
     },
     async requestVerification(input) {
       await tasks.getContext(input.taskId);
-      const verification = await requestVerification(input, {
-        db: env.DB,
-        github,
-      });
-      await audit(
+      const operation = await beginOperation(
+        env.DB,
+        actor,
         "request_verification",
         "verification_request",
+        crypto.randomUUID(),
+        input,
+      );
+      if (!operation.execute) {
+        if (operation.record.status === "succeeded") {
+          const existing = await env.DB
+            .prepare("SELECT request_id FROM verification_requests WHERE request_id = ?")
+            .bind(operation.record.resourceId)
+            .first<{ request_id: string }>();
+          if (existing) {
+            return {
+              requestId: existing.request_id,
+              workflowRunUrl: verificationWorkflowUrl(input.repository),
+            };
+          }
+        }
+        throw new Error("OPERATION_PENDING");
+      }
+      let verification: { requestId: string; workflowRunUrl: string };
+      try {
+        verification = await requestVerification(input, {
+          db: env.DB,
+          github,
+          newId: () => operation.record.resourceId,
+        });
+      } catch (error) {
+        await markUncertain(env.DB, operation.record.eventId, error);
+        throw error;
+      }
+      await markSucceeded(
+        env.DB,
+        operation.record.eventId,
         verification.requestId,
       );
       return verification;
@@ -142,8 +223,28 @@ export function createProofOpsTools(
     investigateIncident: ({ sentryIssueUrlOrId }) =>
       sentry.investigateIncident(sentryIssueUrlOrId),
     async createNotionIssue(input) {
-      const issue = await notion.createIssue(input);
-      await audit("create_notion_issue", "notion_issue", issue.pageId);
+      const operation = await beginOperation(
+        env.DB,
+        actor,
+        "create_notion_issue",
+        "notion_issue",
+        crypto.randomUUID(),
+        input,
+      );
+      if (!operation.execute) {
+        if (operation.record.status === "succeeded") {
+          return notion.getIssue(operation.record.resourceId);
+        }
+        throw new Error("OPERATION_PENDING");
+      }
+      let issue: NotionIssue;
+      try {
+        issue = await notion.createIssue(input);
+      } catch (error) {
+        await markUncertain(env.DB, operation.record.eventId, error);
+        throw error;
+      }
+      await markSucceeded(env.DB, operation.record.eventId, issue.pageId);
       return issue;
     },
   };
@@ -162,28 +263,166 @@ type MutationResourceType =
   | "verification_request"
   | "notion_issue";
 
-async function recordAuditEvent(
+type OperationStatus = "pending" | "succeeded" | "failed_retryable";
+
+interface OperationRecord {
+  eventId: string;
+  resourceId: string;
+  status: OperationStatus;
+}
+
+async function beginOperation(
   db: D1Database,
   actor: Actor,
   action: MutationAction,
   resourceType: MutationResourceType,
-  resourceId: string,
-): Promise<void> {
-  await db
+  initialResourceId: string,
+  input: unknown,
+): Promise<{ record: OperationRecord; execute: boolean }> {
+  const idempotencyKey = await operationKey(actor, action, input);
+  const eventId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const inserted = await db
     .prepare(
-      `INSERT INTO audit_events (
-         event_id, actor_github_user_id, action, resource_type, resource_id, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO audit_events (
+         event_id, actor_github_user_id, action, resource_type, resource_id,
+         created_at, status, idempotency_key, updated_at, error_code
+       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+       RETURNING event_id, resource_id, status`,
     )
     .bind(
-      crypto.randomUUID(),
+      eventId,
       actor.githubUserId,
       action,
       resourceType,
-      resourceId,
-      new Date().toISOString(),
+      initialResourceId,
+      now,
+      idempotencyKey,
+      now,
     )
+    .first<OperationRow>();
+  if (inserted) return { record: mapOperation(inserted), execute: true };
+
+  const retry = await db
+    .prepare(
+      `UPDATE audit_events
+       SET status = 'pending', error_code = NULL, updated_at = ?
+       WHERE idempotency_key = ? AND status = 'failed_retryable'
+       RETURNING event_id, resource_id, status`,
+    )
+    .bind(now, idempotencyKey)
+    .first<OperationRow>();
+  if (retry) return { record: mapOperation(retry), execute: true };
+
+  const existing = await db
+    .prepare(
+      `SELECT event_id, resource_id, status
+       FROM audit_events WHERE idempotency_key = ?`,
+    )
+    .bind(idempotencyKey)
+    .first<OperationRow>();
+  if (!existing) throw new Error("OPERATION_STATE_MISSING");
+  return { record: mapOperation(existing), execute: false };
+}
+
+interface OperationRow {
+  event_id: string;
+  resource_id: string;
+  status: OperationStatus;
+}
+
+function mapOperation(row: OperationRow): OperationRecord {
+  return {
+    eventId: row.event_id,
+    resourceId: row.resource_id,
+    status: row.status,
+  };
+}
+
+async function markSucceeded(
+  db: D1Database,
+  eventId: string,
+  resourceId: string,
+): Promise<void> {
+  const result = await db
+    .prepare(
+      `UPDATE audit_events
+       SET status = 'succeeded', resource_id = ?, error_code = NULL, updated_at = ?
+       WHERE event_id = ? AND status = 'pending'`,
+    )
+    .bind(resourceId, new Date().toISOString(), eventId)
     .run();
+  if (result.meta.changes !== 1) throw new Error("OPERATION_STATE_INVALID");
+}
+
+async function markRetryable(
+  db: D1Database,
+  eventId: string,
+  error: unknown,
+): Promise<void> {
+  await updateFailure(db, eventId, "failed_retryable", error);
+}
+
+async function markUncertain(
+  db: D1Database,
+  eventId: string,
+  error: unknown,
+): Promise<void> {
+  try {
+    await updateFailure(db, eventId, "pending", error);
+  } catch {
+    // 외부 효과가 불확실하므로 감사 상태 갱신 실패 시에도 pending을 유지한다.
+  }
+}
+
+async function updateFailure(
+  db: D1Database,
+  eventId: string,
+  status: "pending" | "failed_retryable",
+  error: unknown,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE audit_events SET status = ?, error_code = ?, updated_at = ?
+       WHERE event_id = ? AND status = 'pending'`,
+    )
+    .bind(status, safeErrorCode(error), new Date().toISOString(), eventId)
+    .run();
+}
+
+function safeErrorCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(message)
+    ? message
+    : "EXTERNAL_EFFECT_UNCERTAIN";
+}
+
+async function operationKey(
+  actor: Actor,
+  action: MutationAction,
+  input: unknown,
+): Promise<string> {
+  const value = JSON.stringify([actor.githubUserId, action, canonicalize(input)]);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+function verificationWorkflowUrl(repository: string): string {
+  return `https://github.com/${repository}/actions/workflows/proofops-verify.yml`;
 }
 
 export async function requestVerification(

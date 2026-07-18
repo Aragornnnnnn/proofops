@@ -32,6 +32,17 @@ export async function handleAuthorize(
     return new Response("Method Not Allowed", { status: 405 });
   }
 
+  const url = new URL(request.url);
+  const clientId = url.searchParams.get("client_id");
+  const redirectUri = url.searchParams.get("redirect_uri");
+  const downstreamState = url.searchParams.get("state") ?? undefined;
+  if (!clientId) return oauthError("invalid_client", 400);
+  const client = await env.OAUTH_PROVIDER.lookupClient(clientId);
+  if (!client) return oauthError("invalid_client", 400);
+  if (!redirectUri || !isRegisteredRedirect(redirectUri, client.redirectUris)) {
+    return oauthError("invalid_request", 400);
+  }
+
   try {
     const oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
     if (
@@ -41,14 +52,12 @@ export async function handleAuthorize(
       !oauthRequest.codeChallenge ||
       oauthRequest.codeChallengeMethod !== "S256"
     ) {
-      return oauthError("invalid_request", 400);
+      return downstreamError(redirectUri, downstreamState, "invalid_request");
     }
     if (!hasOnlyMcpScope(oauthRequest.scope)) {
-      return oauthError("invalid_scope", 400);
+      return downstreamError(redirectUri, downstreamState, "invalid_scope");
     }
 
-    const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
-    if (!client) return oauthError("invalid_client", 400);
     const state = randomToken();
     await putExpiringState(env.DB, "github", state, { request: oauthRequest });
 
@@ -60,7 +69,7 @@ export async function handleAuthorize(
     }).toString();
     return Response.redirect(githubAuthorizeUrl.toString(), 302);
   } catch {
-    return oauthError("invalid_request", 400);
+    return downstreamError(redirectUri, downstreamState, "invalid_request");
   }
 }
 
@@ -69,16 +78,18 @@ export async function handleGitHubCallback(
   env: Env,
 ): Promise<Response> {
   const url = new URL(request.url);
-  const code = url.searchParams.get("code");
   const stateToken = url.searchParams.get("state");
-  if (!code || !stateToken || url.searchParams.has("error")) {
-    return new Response("GitHub authentication failed", { status: 401 });
-  }
+  if (!stateToken) return new Response("Invalid OAuth state", { status: 403 });
 
   const state = await takeState<UpstreamState>(env.DB, "github", stateToken);
   if (!validUpstreamState(state)) {
     return new Response("Invalid OAuth state", { status: 403 });
   }
+  if (url.searchParams.has("error")) {
+    return authorizationRedirect(state.request, "access_denied");
+  }
+  const code = url.searchParams.get("code");
+  if (!code) return authorizationRedirect(state.request, "server_error");
 
   try {
     const githubToken = await exchangeGitHubCode(code, request, env);
@@ -88,7 +99,7 @@ export async function handleGitHubCallback(
       parseAllowedGitHubLogins(env.PROOFOPS_ALLOWED_GITHUB_LOGINS),
     );
     const client = await env.OAUTH_PROVIDER.lookupClient(state.request.clientId);
-    if (!client) return oauthError("invalid_client", 400);
+    if (!client) return authorizationRedirect(state.request, "server_error");
 
     const csrfToken = randomToken();
     const consentState: ConsentState = {
@@ -100,9 +111,12 @@ export async function handleGitHubCallback(
     return consentPage(csrfToken, consentState);
   } catch (error) {
     if (error instanceof AuthorizationError) {
-      return new Response(error.message, { status: error.status });
+      return authorizationRedirect(
+        state.request,
+        error.status === 403 ? "access_denied" : "server_error",
+      );
     }
-    return new Response("GitHub authentication failed", { status: 401 });
+    return authorizationRedirect(state.request, "server_error");
   }
 }
 
@@ -129,14 +143,18 @@ async function handleConsent(request: Request, env: Env): Promise<Response> {
     return new Response("Invalid consent", { status: 403 });
   }
 
-  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-    request: state.request,
-    userId: `github-${state.actor.githubUserId}`,
-    metadata: state.actor,
-    scope: [MCP_SCOPE],
-    props: state.actor,
-  });
-  return Response.redirect(redirectTo, 302);
+  try {
+    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: state.request,
+      userId: `github-${state.actor.githubUserId}`,
+      metadata: state.actor,
+      scope: [MCP_SCOPE],
+      props: state.actor,
+    });
+    return Response.redirect(redirectTo, 302);
+  } catch {
+    return authorizationRedirect(state.request, "server_error");
+  }
 }
 
 async function exchangeGitHubCode(
@@ -226,10 +244,7 @@ function consentBindingMatches(form: FormData, state: ConsentState): boolean {
 }
 
 function deniedRedirect(request: AuthRequest): string {
-  const redirect = new URL(request.redirectUri);
-  redirect.searchParams.set("error", "access_denied");
-  if (request.state) redirect.searchParams.set("state", request.state);
-  return redirect.toString();
+  return authorizationRedirectUrl(request.redirectUri, request.state, "access_denied");
 }
 
 async function putExpiringState(
@@ -319,10 +334,73 @@ function formString(form: FormData, name: string): string | null {
 }
 
 function oauthError(
-  error: "invalid_client" | "invalid_request" | "invalid_scope",
+  error: "invalid_client" | "invalid_request",
   status: number,
 ): Response {
   return Response.json({ error }, { status });
+}
+
+type RedirectError =
+  | "invalid_request"
+  | "invalid_scope"
+  | "access_denied"
+  | "server_error";
+
+function downstreamError(
+  redirectUri: string,
+  state: string | undefined,
+  error: RedirectError,
+): Response {
+  return Response.redirect(authorizationRedirectUrl(redirectUri, state, error), 302);
+}
+
+function authorizationRedirect(request: AuthRequest, error: RedirectError): Response {
+  return downstreamError(request.redirectUri, request.state, error);
+}
+
+function authorizationRedirectUrl(
+  redirectUri: string,
+  state: string | undefined,
+  error: RedirectError,
+): string {
+  const redirect = new URL(redirectUri);
+  redirect.searchParams.set("error", error);
+  if (state) redirect.searchParams.set("state", state);
+  return redirect.toString();
+}
+
+function isRegisteredRedirect(candidate: string, registered: string[]): boolean {
+  let candidateUrl: URL;
+  try {
+    candidateUrl = new URL(candidate);
+  } catch {
+    return false;
+  }
+  return registered.some((value) => {
+    if (value === candidate) return true;
+    try {
+      const allowed = new URL(value);
+      return (
+        isLoopback(candidateUrl.hostname) &&
+        isLoopback(allowed.hostname) &&
+        candidateUrl.protocol === allowed.protocol &&
+        candidateUrl.hostname === allowed.hostname &&
+        candidateUrl.pathname === allowed.pathname &&
+        candidateUrl.search === allowed.search
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
+function isLoopback(hostname: string): boolean {
+  return (
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname) ||
+    hostname === "::1" ||
+    hostname === "[::1]" ||
+    hostname.toLowerCase() === "localhost"
+  );
 }
 
 function escapeHtml(value: string): string {
