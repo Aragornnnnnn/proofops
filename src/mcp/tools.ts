@@ -6,14 +6,15 @@ import adapter from "../../landit/adapter.json";
 import type { Actor } from "../auth/authorization";
 import type { Env } from "../env";
 import { createGitHubClient, type GitHubPort } from "../github/app-client";
-import { linkPullRequest, reconcileTask } from "../github/webhook";
+import { reconcileTask } from "../github/webhook";
+import { assertAllowedPullRequest } from "../github/events";
 import { createNotionClient } from "../notion/client";
 import type { CreateIssueInput, NotionIssue, NotionPort } from "../notion/service";
 import { createSentryClient, type SentryPort } from "../sentry/client";
 import type { IncidentEvidence } from "../sentry/mapper";
 import type { TaskContext } from "../tasks/repository";
-import { D1TaskRepository } from "../tasks/repository";
-import { TaskService } from "../tasks/service";
+import { D1TaskRepository, prepareUpsertPullRequest } from "../tasks/repository";
+import { mapTechnicalStatusForNotion, TaskService } from "../tasks/service";
 import {
   getTaskStatusInputSchema,
   createNotionIssueInputSchema,
@@ -24,6 +25,7 @@ import {
   recordProgressInputSchema,
   requestVerificationInputSchema,
   startTaskInputSchema,
+  linkPullRequestInputSchema,
   taskContextSchema,
   verificationDispatchSchema,
 } from "./schemas";
@@ -38,8 +40,9 @@ export interface ProgressNote {
 }
 
 export interface ProofOpsTools {
-  startTask(input: { notionPageIdOrUrl: string }): Promise<TaskContext>;
+  startTask(input: { operationId: string; notionPageIdOrUrl: string }): Promise<TaskContext>;
   linkPullRequest(input: {
+    operationId: string;
     taskId: string;
     pullRequestUrl: string;
   }): Promise<TaskContext>;
@@ -51,15 +54,20 @@ export interface ProofOpsTools {
     evidenceUrl?: string;
   }): Promise<ProgressNote>;
   requestVerification(input: {
+    operationId: string;
     taskId: string;
     repository: string;
     environment: "develop" | "prod";
     commitSha: string;
-  }): Promise<{ requestId: string; workflowRunUrl: string }>;
+  }): Promise<{
+    requestId: string;
+    workflowRunUrl: string;
+    status: string;
+  }>;
   investigateIncident(input: {
     sentryIssueUrlOrId: string;
   }): Promise<IncidentEvidence>;
-  createNotionIssue(input: CreateIssueInput): Promise<NotionIssue>;
+  createNotionIssue(input: CreateIssueInput & { operationId: string }): Promise<NotionIssue>;
 }
 
 export function createProofOpsTools(
@@ -80,63 +88,107 @@ export function createProofOpsTools(
   );
 
   return {
-    async startTask({ notionPageIdOrUrl }) {
-      const operation = await beginOperation(
+    async startTask({ operationId, notionPageIdOrUrl }) {
+      const issue = await notion.getIssue(notionPageIdOrUrl);
+      const operation = await openOperation(
         env.DB,
         actor,
+        operationId,
         "start_task",
         "task",
         notionPageIdOrUrl,
         { notionPageIdOrUrl },
       );
-      if (!operation.execute) {
-        if (operation.record.status === "succeeded") {
-          return tasks.getContext(operation.record.resourceId);
-        }
-        throw new Error("OPERATION_PENDING");
+      if (operation.phase === "succeeded") {
+        return tasks.getContext(operation.resourceId);
       }
-
-      let issue: NotionIssue;
+      const task = await tasks.upsertFromNotion(issue);
+      await setOperationPhase(env.DB, operationId, "effect_started", task.id);
       try {
-        issue = await notion.getIssue(notionPageIdOrUrl);
+        await notion.updateTechnicalStatus(
+          task.notionPageId,
+          mapTechnicalStatusForNotion(task.technicalStatus),
+        );
+        await tasks.clearSyncError(task.id);
       } catch (error) {
-        await markRetryable(env.DB, operation.record.eventId, error);
+        await tasks.recordSyncError(task.id, "NOTION_SYNC_FAILED");
+        await setOperationPhase(
+          env.DB,
+          operationId,
+          "failed_retryable",
+          task.id,
+          error,
+        );
         throw error;
       }
-      let task: TaskContext;
-      try {
-        task = await taskService.startTaskFromIssue(issue);
-      } catch (error) {
-        await markUncertain(env.DB, operation.record.eventId, error);
-        throw error;
-      }
-      await markSucceeded(env.DB, operation.record.eventId, task.id);
-      return task;
+      await setOperationPhase(env.DB, operationId, "succeeded", task.id);
+      return tasks.getContext(task.id);
     },
     async linkPullRequest(input) {
-      const operation = await beginOperation(
+      const { operationId, ...linkInput } = input;
+      assertAllowedPullRequest(linkInput.pullRequestUrl);
+      await tasks.getContext(linkInput.taskId);
+      const pullRequest = await github.getPullRequest(linkInput.pullRequestUrl);
+      const currentReference = assertAllowedPullRequest(pullRequest.url);
+      if (
+        pullRequest.repository.toLowerCase() !==
+        currentReference.repository.toLowerCase()
+      ) {
+        throw new Error("GITHUB_REPOSITORY_NOT_ALLOWED");
+      }
+      const operation = await openOperation(
         env.DB,
         actor,
+        operationId,
         "link_pull_request",
         "task",
-        input.taskId,
-        input,
+        linkInput.taskId,
+        linkInput,
       );
-      if (!operation.execute) {
-        if (operation.record.status === "succeeded") {
-          return tasks.getContext(operation.record.resourceId);
-        }
-        throw new Error("OPERATION_PENDING");
+      if (operation.phase === "succeeded") {
+        return tasks.getContext(operation.resourceId);
       }
-      let task: TaskContext;
+      await setOperationPhase(env.DB, operationId, "effect_started", linkInput.taskId);
       try {
-        task = await linkPullRequest(input, { db: env.DB, github, notion });
+        const now = new Date().toISOString();
+        await env.DB.batch([
+          prepareUpsertPullRequest(env.DB, {
+            id: crypto.randomUUID(),
+            taskId: linkInput.taskId,
+            repository: pullRequest.repository,
+            prNumber: pullRequest.number,
+            prUrl: pullRequest.url,
+            state: pullRequest.state,
+            reviewState: pullRequest.review,
+            ciState: pullRequest.ci,
+            headSha: pullRequest.headSha,
+            updatedAt: now,
+          }),
+          env.DB
+            .prepare(
+              `UPDATE audit_events
+               SET status = 'succeeded', resource_id = ?, error_code = NULL,
+                   updated_at = ?
+               WHERE operation_id = ?`,
+            )
+            .bind(linkInput.taskId, now, operationId),
+        ]);
       } catch (error) {
-        await markUncertain(env.DB, operation.record.eventId, error);
+        await setOperationPhase(
+          env.DB,
+          operationId,
+          "failed_retryable",
+          linkInput.taskId,
+          error,
+        );
         throw error;
       }
-      await markSucceeded(env.DB, operation.record.eventId, task.id);
-      return task;
+      try {
+        await reconcileTask({ db: env.DB, github, notion }, linkInput.taskId);
+      } catch {
+        // 링크 저장은 완료됐으므로 후속 조회에서 다시 조정한다.
+      }
+      return tasks.getContext(linkInput.taskId);
     },
     getTaskStatus: ({ taskId }) => taskService.getTaskStatus(taskId),
     async recordProgress({ taskId, kind, summary, evidenceUrl }) {
@@ -178,74 +230,104 @@ export function createProofOpsTools(
       return note;
     },
     async requestVerification(input) {
-      await tasks.getContext(input.taskId);
-      const operation = await beginOperation(
+      const { operationId, ...verificationInput } = input;
+      await tasks.getContext(verificationInput.taskId);
+      const linkedCommit = await env.DB
+        .prepare(
+          `SELECT 1 AS linked FROM pull_requests
+           WHERE task_id = ? AND lower(repository) = lower(?)
+             AND lower(head_sha) = lower(?) LIMIT 1`,
+        )
+        .bind(
+          verificationInput.taskId,
+          verificationInput.repository,
+          verificationInput.commitSha,
+        )
+        .first();
+      if (!linkedCommit) throw new Error("INPUT_INVALID");
+      const operation = await openOperation(
         env.DB,
         actor,
+        operationId,
         "request_verification",
         "verification_request",
-        crypto.randomUUID(),
-        input,
+        operationId,
+        verificationInput,
       );
-      if (!operation.execute) {
-        if (operation.record.status === "succeeded") {
-          const existing = await env.DB
-            .prepare("SELECT request_id FROM verification_requests WHERE request_id = ?")
-            .bind(operation.record.resourceId)
-            .first<{ request_id: string }>();
-          if (existing) {
-            return {
-              requestId: existing.request_id,
-              workflowRunUrl: verificationWorkflowUrl(input.repository),
-            };
-          }
-        }
-        throw new Error("OPERATION_PENDING");
+      if (operation.phase !== "validated" && operation.phase !== "failed_retryable") {
+        const existing = await verificationResult(
+          env.DB,
+          operationId,
+          verificationInput.repository,
+        );
+        if (existing) return existing;
+        throw new Error("OPERATION_RECONCILE_REQUIRED");
       }
-      let verification: { requestId: string; workflowRunUrl: string };
+      await setOperationPhase(env.DB, operationId, "effect_started", operationId);
       try {
-        verification = await requestVerification(input, {
+        await requestVerification(verificationInput, {
           db: env.DB,
           github,
-          newId: () => operation.record.resourceId,
+          newId: () => operationId,
         });
       } catch (error) {
-        await markUncertain(env.DB, operation.record.eventId, error);
+        const existing = await verificationResult(
+          env.DB,
+          operationId,
+          verificationInput.repository,
+        );
+        if (existing) {
+          await setOperationPhase(env.DB, operationId, "succeeded", operationId);
+          return existing;
+        }
+        await setOperationPhase(
+          env.DB,
+          operationId,
+          "failed_retryable",
+          operationId,
+          error,
+        );
         throw error;
       }
-      await markSucceeded(
+      await setOperationPhase(env.DB, operationId, "succeeded", operationId);
+      const result = await verificationResult(
         env.DB,
-        operation.record.eventId,
-        verification.requestId,
+        operationId,
+        verificationInput.repository,
       );
-      return verification;
+      if (!result) throw new Error("OPERATION_STATE_MISSING");
+      return result;
     },
     investigateIncident: ({ sentryIssueUrlOrId }) =>
       sentry.investigateIncident(sentryIssueUrlOrId),
     async createNotionIssue(input) {
-      const operation = await beginOperation(
+      const { operationId, ...issueInput } = input;
+      const operation = await openOperation(
         env.DB,
         actor,
+        operationId,
         "create_notion_issue",
         "notion_issue",
-        crypto.randomUUID(),
-        input,
+        operationId,
+        issueInput,
       );
-      if (!operation.execute) {
-        if (operation.record.status === "succeeded") {
-          return notion.getIssue(operation.record.resourceId);
-        }
-        throw new Error("OPERATION_PENDING");
+      if (operation.phase === "succeeded") {
+        return notion.getIssue(operation.resourceId);
       }
-      let issue: NotionIssue;
+      if (
+        operation.phase === "effect_started" ||
+        operation.phase === "reconcile_required"
+      ) {
+        return reconcileNotionCreation(env.DB, notion, operationId);
+      }
+      await setOperationPhase(env.DB, operationId, "effect_started", operationId);
       try {
-        issue = await notion.createIssue(input);
+        const issue = await notion.createIssue(issueInput, operationId);
+        await setOperationPhase(env.DB, operationId, "succeeded", issue.pageId);
+        return issue;
       } catch (error) {
-        await markUncertain(env.DB, operation.record.eventId, error);
-        throw error;
+        return reconcileNotionCreation(env.DB, notion, operationId);
       }
-      await markSucceeded(env.DB, operation.record.eventId, issue.pageId);
-      return issue;
     },
   };
 }
@@ -263,32 +345,38 @@ type MutationResourceType =
   | "verification_request"
   | "notion_issue";
 
-type OperationStatus = "pending" | "succeeded" | "failed_retryable";
+type OperationPhase =
+  | "validated"
+  | "effect_started"
+  | "succeeded"
+  | "failed_retryable"
+  | "reconcile_required";
 
 interface OperationRecord {
-  eventId: string;
+  operationId: string;
   resourceId: string;
-  status: OperationStatus;
+  phase: OperationPhase;
 }
 
-async function beginOperation(
+async function openOperation(
   db: D1Database,
   actor: Actor,
+  operationId: string,
   action: MutationAction,
   resourceType: MutationResourceType,
   initialResourceId: string,
   input: unknown,
-): Promise<{ record: OperationRecord; execute: boolean }> {
-  const idempotencyKey = await operationKey(actor, action, input);
+): Promise<OperationRecord> {
+  const inputHash = await operationInputHash(input);
   const eventId = crypto.randomUUID();
   const now = new Date().toISOString();
-  const inserted = await db
+  await db
     .prepare(
       `INSERT OR IGNORE INTO audit_events (
          event_id, actor_github_user_id, action, resource_type, resource_id,
-         created_at, status, idempotency_key, updated_at, error_code
-       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
-       RETURNING event_id, resource_id, status`,
+         created_at, status, idempotency_key, updated_at, error_code,
+         operation_id, input_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, 'validated', NULL, ?, NULL, ?, ?)`,
     )
     .bind(
       eventId,
@@ -297,97 +385,93 @@ async function beginOperation(
       resourceType,
       initialResourceId,
       now,
-      idempotencyKey,
       now,
+      operationId,
+      inputHash,
     )
-    .first<OperationRow>();
-  if (inserted) return { record: mapOperation(inserted), execute: true };
-
-  const retry = await db
-    .prepare(
-      `UPDATE audit_events
-       SET status = 'pending', error_code = NULL, updated_at = ?
-       WHERE idempotency_key = ? AND status = 'failed_retryable'
-       RETURNING event_id, resource_id, status`,
-    )
-    .bind(now, idempotencyKey)
-    .first<OperationRow>();
-  if (retry) return { record: mapOperation(retry), execute: true };
-
+    .run();
   const existing = await db
     .prepare(
-      `SELECT event_id, resource_id, status
-       FROM audit_events WHERE idempotency_key = ?`,
+      `SELECT operation_id, actor_github_user_id, action, input_hash,
+              resource_id, status
+       FROM audit_events WHERE operation_id = ?`,
     )
-    .bind(idempotencyKey)
+    .bind(operationId)
     .first<OperationRow>();
   if (!existing) throw new Error("OPERATION_STATE_MISSING");
-  return { record: mapOperation(existing), execute: false };
+  if (
+    existing.actor_github_user_id !== actor.githubUserId ||
+    existing.action !== action ||
+    existing.input_hash !== inputHash
+  ) {
+    throw new Error("OPERATION_CONFLICT");
+  }
+  return mapOperation(existing);
 }
 
 interface OperationRow {
-  event_id: string;
+  operation_id: string;
+  actor_github_user_id: number;
+  action: string;
+  input_hash: string;
   resource_id: string;
-  status: OperationStatus;
+  status: OperationPhase;
 }
 
 function mapOperation(row: OperationRow): OperationRecord {
   return {
-    eventId: row.event_id,
+    operationId: row.operation_id,
     resourceId: row.resource_id,
-    status: row.status,
+    phase: row.status,
   };
 }
 
-async function markSucceeded(
+async function setOperationPhase(
   db: D1Database,
-  eventId: string,
+  operationId: string,
+  phase: OperationPhase,
   resourceId: string,
+  error?: unknown,
 ): Promise<void> {
   const result = await db
     .prepare(
       `UPDATE audit_events
-       SET status = 'succeeded', resource_id = ?, error_code = NULL, updated_at = ?
-       WHERE event_id = ? AND status = 'pending'`,
+       SET status = ?, resource_id = ?, error_code = ?, updated_at = ?
+       WHERE operation_id = ?`,
     )
-    .bind(resourceId, new Date().toISOString(), eventId)
+    .bind(
+      phase,
+      resourceId,
+      error === undefined ? null : safeErrorCode(error),
+      new Date().toISOString(),
+      operationId,
+    )
     .run();
   if (result.meta.changes !== 1) throw new Error("OPERATION_STATE_INVALID");
 }
 
-async function markRetryable(
+async function reconcileNotionCreation(
   db: D1Database,
-  eventId: string,
-  error: unknown,
-): Promise<void> {
-  await updateFailure(db, eventId, "failed_retryable", error);
-}
-
-async function markUncertain(
-  db: D1Database,
-  eventId: string,
-  error: unknown,
-): Promise<void> {
+  notion: NotionPort,
+  operationId: string,
+): Promise<NotionIssue> {
   try {
-    await updateFailure(db, eventId, "pending", error);
+    const issue = await notion.findIssueByOperationMarker?.(operationId);
+    if (issue) {
+      await setOperationPhase(db, operationId, "succeeded", issue.pageId);
+      return issue;
+    }
   } catch {
-    // 외부 효과가 불확실하므로 감사 상태 갱신 실패 시에도 pending을 유지한다.
+    // 조회 실패도 marker의 존재나 부재를 증명하지 못한다.
   }
-}
-
-async function updateFailure(
-  db: D1Database,
-  eventId: string,
-  status: "pending" | "failed_retryable",
-  error: unknown,
-): Promise<void> {
-  await db
-    .prepare(
-      `UPDATE audit_events SET status = ?, error_code = ?, updated_at = ?
-       WHERE event_id = ? AND status = 'pending'`,
-    )
-    .bind(status, safeErrorCode(error), new Date().toISOString(), eventId)
-    .run();
+  await setOperationPhase(
+    db,
+    operationId,
+    "reconcile_required",
+    operationId,
+    new Error("OPERATION_RECONCILE_REQUIRED"),
+  );
+  throw new Error("OPERATION_RECONCILE_REQUIRED");
 }
 
 function safeErrorCode(error: unknown): string {
@@ -397,12 +481,8 @@ function safeErrorCode(error: unknown): string {
     : "EXTERNAL_EFFECT_UNCERTAIN";
 }
 
-async function operationKey(
-  actor: Actor,
-  action: MutationAction,
-  input: unknown,
-): Promise<string> {
-  const value = JSON.stringify([actor.githubUserId, action, canonicalize(input)]);
+async function operationInputHash(input: unknown): Promise<string> {
+  const value = JSON.stringify(canonicalize(input));
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
@@ -423,6 +503,28 @@ function canonicalize(value: unknown): unknown {
 
 function verificationWorkflowUrl(repository: string): string {
   return `https://github.com/${repository}/actions/workflows/proofops-verify.yml`;
+}
+
+async function verificationResult(
+  db: D1Database,
+  requestId: string,
+  repository: string,
+): Promise<{
+  requestId: string;
+  workflowRunUrl: string;
+  status: string;
+} | null> {
+  const row = await db
+    .prepare("SELECT request_id, status FROM verification_requests WHERE request_id = ?")
+    .bind(requestId)
+    .first<{ request_id: string; status: string }>();
+  return row
+    ? {
+        requestId: row.request_id,
+        workflowRunUrl: verificationWorkflowUrl(repository),
+        status: row.status,
+      }
+    : null;
 }
 
 export async function requestVerification(
@@ -609,6 +711,7 @@ export function registerProofOpsTools(server: McpServer, tools: ProofOpsTools): 
 }
 
 const mcpStartTaskInputSchema = z.object({
+  operationId: z.string().catch(""),
   notionPageIdOrUrl: z.string().catch(""),
 });
 
@@ -616,12 +719,8 @@ const mcpGetTaskStatusInputSchema = z.object({
   taskId: z.string().catch(""),
 });
 
-const linkPullRequestInputSchema = z.object({
-  taskId: z.string().trim().min(1),
-  pullRequestUrl: z.url().refine((value) => value.startsWith("https://github.com/")),
-});
-
 const mcpLinkPullRequestInputSchema = z.object({
+  operationId: z.string().catch(""),
   taskId: z.string().catch(""),
   pullRequestUrl: z.string().catch(""),
 });
@@ -634,6 +733,7 @@ const mcpRecordProgressInputSchema = z.object({
 });
 
 const mcpRequestVerificationInputSchema = z.object({
+  operationId: z.string().catch(""),
   taskId: z.string().catch(""),
   repository: z.string().catch(""),
   environment: z.string().catch(""),
@@ -645,6 +745,7 @@ const mcpInvestigateIncidentInputSchema = z.object({
 });
 
 const mcpCreateNotionIssueInputSchema = z.object({
+  operationId: z.string().catch(""),
   title: z.string().catch(""),
   impact: z.string().catch(""),
   evidence: z
@@ -684,6 +785,9 @@ function toSafeMcpErrorCode(error: unknown):
   | "TASK_NOT_FOUND"
   | "INPUT_INVALID"
   | "NOTION_CREATE_FAILED"
+  | "NOTION_STATUS_UPDATE_FAILED"
+  | "OPERATION_CONFLICT"
+  | "OPERATION_RECONCILE_REQUIRED"
   | "SENTRY_AUTH_FAILED"
   | "SENTRY_FORBIDDEN"
   | "SENTRY_NOT_FOUND"
@@ -701,6 +805,13 @@ function toSafeMcpErrorCode(error: unknown):
   }
   if (message === "TASK_NOT_FOUND") return "TASK_NOT_FOUND";
   if (message === "NOTION_CREATE_FAILED") return "NOTION_CREATE_FAILED";
+  if (message === "NOTION_STATUS_UPDATE_FAILED") {
+    return "NOTION_STATUS_UPDATE_FAILED";
+  }
+  if (message === "OPERATION_CONFLICT") return "OPERATION_CONFLICT";
+  if (message === "OPERATION_RECONCILE_REQUIRED") {
+    return "OPERATION_RECONCILE_REQUIRED";
+  }
   if (message === "SENTRY_AUTH_FAILED") return "SENTRY_AUTH_FAILED";
   if (message === "SENTRY_FORBIDDEN") return "SENTRY_FORBIDDEN";
   if (message === "SENTRY_NOT_FOUND") return "SENTRY_NOT_FOUND";

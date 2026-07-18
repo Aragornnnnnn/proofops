@@ -45,8 +45,13 @@ beforeEach(async () => {
         status TEXT NOT NULL DEFAULT 'succeeded',
         idempotency_key TEXT,
         updated_at TEXT,
-        error_code TEXT
+        error_code TEXT,
+        operation_id TEXT,
+        input_hash TEXT
       )`),
+    env.DB.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS audit_events_operation_id_idx
+      ON audit_events(operation_id) WHERE operation_id IS NOT NULL`),
     env.DB.prepare(`
       CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_key_idx
       ON audit_events(idempotency_key) WHERE idempotency_key IS NOT NULL`),
@@ -123,6 +128,7 @@ afterEach(async () => {
     env.DB.prepare("DROP TRIGGER IF EXISTS fail_dispatched_update"),
     env.DB.prepare("DROP TRIGGER IF EXISTS fail_record_progress_audit"),
     env.DB.prepare("DROP TRIGGER IF EXISTS fail_create_notion_terminal_audit"),
+    env.DB.prepare("DROP TRIGGER IF EXISTS fail_effect_start"),
     env.DB.prepare("DELETE FROM verification_requests"),
     env.DB.prepare("DELETE FROM audit_events"),
     env.DB.prepare("DELETE FROM progress_notes"),
@@ -184,8 +190,12 @@ describe("mutation actor audit", () => {
       { github, notion, sentry },
     );
 
-    const started = await tools.startTask({ notionPageIdOrUrl: "notion-started" });
+    const started = await tools.startTask({
+      operationId: "10000000-0000-4000-8000-000000000001",
+      notionPageIdOrUrl: "notion-started",
+    });
     await tools.linkPullRequest({
+      operationId: "10000000-0000-4000-8000-000000000002",
       taskId: "task-1",
       pullRequestUrl: "https://github.com/Aragornnnnnn/landit-be/pull/43",
     });
@@ -195,12 +205,14 @@ describe("mutation actor audit", () => {
       summary: "검증 통과",
     });
     const verification = await tools.requestVerification({
+      operationId: "10000000-0000-4000-8000-000000000003",
       taskId: "task-1",
       repository: "Aragornnnnnn/landit-be",
       environment: "develop",
       commitSha,
     });
     const notionIssue = await tools.createNotionIssue({
+      operationId: "10000000-0000-4000-8000-000000000004",
       title: "운영 이슈",
       impact: "영향",
       evidence: [],
@@ -254,7 +266,7 @@ describe("mutation actor audit", () => {
     ]);
   });
 
-  it("side effect 여부가 불확실한 외부 API 오류는 pending으로 유지한다", async () => {
+  it("Notion 생성 여부가 불확실하면 reconcile_required로 유지한다", async () => {
     const tools = createProofOpsTools(
       env,
       { githubUserId: 101, githubLogin: "alice" },
@@ -269,6 +281,7 @@ describe("mutation actor audit", () => {
 
     await expect(
       tools.createNotionIssue({
+        operationId: "10000000-0000-4000-8000-000000000005",
         title: "실패",
         impact: "영향",
         evidence: [],
@@ -276,14 +289,14 @@ describe("mutation actor audit", () => {
         scope: [],
         acceptanceCriteria: [],
       }),
-    ).rejects.toThrow("NOTION_CREATE_FAILED");
+    ).rejects.toThrow("OPERATION_RECONCILE_REQUIRED");
     await expect(env.DB.prepare(
       "SELECT actor_github_user_id, action, status, error_code FROM audit_events",
     ).first()).resolves.toEqual({
       actor_github_user_id: 101,
       action: "create_notion_issue",
-      status: "pending",
-      error_code: "NOTION_CREATE_FAILED",
+      status: "reconcile_required",
+      error_code: "OPERATION_RECONCILE_REQUIRED",
     });
   });
 
@@ -324,12 +337,15 @@ describe("mutation actor audit", () => {
         },
       },
     );
-    const input = { notionPageIdOrUrl: issue.pageId };
+    const input = {
+      operationId: "10000000-0000-4000-8000-000000000006",
+      notionPageIdOrUrl: issue.pageId,
+    };
 
     await expect(tools.startTask(input)).rejects.toThrow("NOTION_READ_FAILED");
     await expect(
-      env.DB.prepare("SELECT status FROM audit_events").first(),
-    ).resolves.toEqual({ status: "failed_retryable" });
+      env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first(),
+    ).resolves.toEqual({ count: 0 });
     await expect(tools.startTask(input)).resolves.toMatchObject({
       notionPageId: issue.pageId,
     });
@@ -400,6 +416,7 @@ describe("mutation actor audit", () => {
       },
     );
     const input = {
+      operationId: "10000000-0000-4000-8000-000000000007",
       title: "중복 방지",
       impact: "영향",
       evidence: [],
@@ -409,15 +426,15 @@ describe("mutation actor audit", () => {
     };
 
     await expect(tools.createNotionIssue(input)).rejects.toThrow(
-      "simulated terminal audit failure",
+      "OPERATION_RECONCILE_REQUIRED",
     );
     await expect(tools.createNotionIssue(input)).rejects.toThrow(
-      "OPERATION_PENDING",
+      "OPERATION_RECONCILE_REQUIRED",
     );
     expect(createIssue).toHaveBeenCalledTimes(1);
     await expect(
       env.DB.prepare("SELECT status FROM audit_events").first(),
-    ).resolves.toEqual({ status: "pending" });
+    ).resolves.toEqual({ status: "reconcile_required" });
   });
 
   it("succeeded operation 재시도는 저장한 resource를 복구하고 외부 생성을 반복하지 않는다", async () => {
@@ -444,6 +461,7 @@ describe("mutation actor audit", () => {
       },
     );
     const input = {
+      operationId: "10000000-0000-4000-8000-000000000008",
       title: "성공 복구",
       impact: "영향",
       evidence: [],
@@ -463,6 +481,238 @@ describe("mutation actor audit", () => {
       status: "succeeded",
       resource_id: createdIssue.pageId,
     });
+  });
+});
+
+describe("caller operation lifecycle", () => {
+  const operationA = "11111111-1111-4111-8111-111111111111";
+  const operationB = "22222222-2222-4222-8222-222222222222";
+  const baseInput = {
+    operationId: operationA,
+    title: "중복 방지",
+    impact: "영향",
+    evidence: [{ label: "근거", url: "https://example.com/evidence" }],
+    causeOrHypothesis: "가설",
+    scope: ["API"],
+    acceptanceCriteria: ["완료"],
+  };
+
+  it("같은 operationId를 다른 입력에 재사용하면 충돌하고 외부 호출을 반복하지 않는다", async () => {
+    const createIssue = vi.fn().mockImplementation(async (input) => ({
+      pageId: `page-${input.title}`,
+      url: `https://notion.so/page-${input.title}`,
+      title: input.title,
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    }));
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: {
+        getIssue: vi.fn(),
+        updateTechnicalStatus: vi.fn(),
+        createIssue,
+        findIssueByOperationMarker: vi.fn(),
+      },
+    });
+
+    await tools.createNotionIssue(baseInput);
+    await expect(
+      tools.createNotionIssue({ ...baseInput, title: "다른 입력" }),
+    ).rejects.toThrow("OPERATION_CONFLICT");
+    expect(createIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("같은 입력도 새 operationId면 의도적인 후속 생성을 허용한다", async () => {
+    const createIssue = vi.fn().mockResolvedValue({
+      pageId: "page-created",
+      url: "https://notion.so/page-created",
+      title: baseInput.title,
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    });
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: {
+        getIssue: vi.fn(),
+        updateTechnicalStatus: vi.fn(),
+        createIssue,
+        findIssueByOperationMarker: vi.fn(),
+      },
+    });
+
+    await tools.createNotionIssue(baseInput);
+    await tools.createNotionIssue({ ...baseInput, operationId: operationB });
+    expect(createIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it("create 응답 유실은 marker로 복구하고 같은 ID 재시도에서 중복 생성하지 않는다", async () => {
+    const recovered = {
+      pageId: "page-recovered",
+      url: "https://notion.so/page-recovered",
+      title: baseInput.title,
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const createIssue = vi.fn().mockRejectedValue(new Error("NOTION_CREATE_FAILED"));
+    const findIssueByOperationMarker = vi.fn().mockResolvedValue(recovered);
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: {
+        getIssue: vi.fn().mockResolvedValue(recovered),
+        updateTechnicalStatus: vi.fn(),
+        createIssue,
+        findIssueByOperationMarker,
+      },
+    });
+
+    await expect(tools.createNotionIssue(baseInput)).resolves.toEqual(recovered);
+    await expect(tools.createNotionIssue(baseInput)).resolves.toEqual(recovered);
+    expect(createIssue).toHaveBeenCalledTimes(1);
+    expect(findIssueByOperationMarker).toHaveBeenCalledWith(operationA);
+  });
+
+  it("marker 존재를 증명하지 못하면 reconcile_required로 남기고 생성하지 않는다", async () => {
+    const createIssue = vi.fn().mockRejectedValue(new Error("NOTION_CREATE_FAILED"));
+    const findIssueByOperationMarker = vi.fn().mockResolvedValue(null);
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: {
+        getIssue: vi.fn(),
+        updateTechnicalStatus: vi.fn(),
+        createIssue,
+        findIssueByOperationMarker,
+      },
+    });
+
+    await expect(tools.createNotionIssue(baseInput)).rejects.toThrow(
+      "OPERATION_RECONCILE_REQUIRED",
+    );
+    await expect(tools.createNotionIssue(baseInput)).rejects.toThrow(
+      "OPERATION_RECONCILE_REQUIRED",
+    );
+    expect(createIssue).toHaveBeenCalledTimes(1);
+    await expect(
+      env.DB.prepare("SELECT status FROM audit_events WHERE operation_id = ?")
+        .bind(operationA)
+        .first(),
+    ).resolves.toEqual({ status: "reconcile_required" });
+  });
+
+  it("read-only validation 실패는 operation을 열지 않아 같은 ID로 안전하게 재시도한다", async () => {
+    const issue = {
+      pageId: "notion-validation",
+      url: "https://notion.so/notion-validation",
+      title: "검증",
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const getIssue = vi.fn().mockRejectedValueOnce(new Error("NOTION_READ_FAILED")).mockResolvedValue(issue);
+    const updateTechnicalStatus = vi.fn().mockResolvedValue(undefined);
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: { getIssue, updateTechnicalStatus, createIssue: vi.fn() },
+    });
+    const input = { operationId: operationA, notionPageIdOrUrl: issue.pageId };
+
+    await expect(tools.startTask(input)).rejects.toThrow("NOTION_READ_FAILED");
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first())
+      .resolves.toEqual({ count: 0 });
+    await expect(tools.startTask(input)).resolves.toMatchObject({ notionPageId: issue.pageId });
+    expect(updateTechnicalStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("effect call 전 crash로 validated에 남은 operation은 같은 ID로 안전하게 시작한다", async () => {
+    await env.DB.prepare(
+      `CREATE TRIGGER fail_effect_start
+       BEFORE UPDATE OF status ON audit_events
+       WHEN NEW.status = 'effect_started'
+       BEGIN SELECT RAISE(ABORT, 'simulated crash before call'); END`,
+    ).run();
+    const created = {
+      pageId: "page-after-crash",
+      url: "https://notion.so/page-after-crash",
+      title: baseInput.title,
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const createIssue = vi.fn().mockResolvedValue(created);
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: { getIssue: vi.fn(), updateTechnicalStatus: vi.fn(), createIssue },
+    });
+
+    await expect(tools.createNotionIssue(baseInput)).rejects.toThrow(
+      "simulated crash before call",
+    );
+    expect(createIssue).not.toHaveBeenCalled();
+    await env.DB.prepare("DROP TRIGGER fail_effect_start").run();
+    await expect(tools.createNotionIssue(baseInput)).resolves.toEqual(created);
+    expect(createIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("idempotent start status patch의 확인된 실패는 같은 ID로 재시도한다", async () => {
+    const issue = {
+      pageId: "notion-patch-retry",
+      url: "https://notion.so/notion-patch-retry",
+      title: "상태 재시도",
+      description: "",
+      acceptanceCriteria: [],
+      repositories: [],
+      currentTechnicalStatus: null,
+    };
+    const updateTechnicalStatus = vi.fn()
+      .mockRejectedValueOnce(new Error("NOTION_STATUS_UPDATE_FAILED"))
+      .mockResolvedValueOnce(undefined);
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      notion: { getIssue: vi.fn().mockResolvedValue(issue), updateTechnicalStatus, createIssue: vi.fn() },
+    });
+    const input = { operationId: operationA, notionPageIdOrUrl: issue.pageId };
+
+    await expect(tools.startTask(input)).rejects.toThrow("NOTION_STATUS_UPDATE_FAILED");
+    await expect(tools.startTask(input)).resolves.toMatchObject({ notionPageId: issue.pageId });
+    expect(updateTechnicalStatus).toHaveBeenCalledTimes(2);
+    await expect(
+      env.DB.prepare("SELECT status FROM audit_events WHERE operation_id = ?")
+        .bind(operationA)
+        .first(),
+    ).resolves.toEqual({ status: "succeeded" });
+  });
+
+  it("verification 응답 유실은 request ID 상태를 반환하고 같은 ID를 재dispatch하지 않는다", async () => {
+    const dispatchVerification = vi.fn().mockRejectedValue(new Error("GITHUB_API_FAILED"));
+    const tools = createProofOpsTools(env, { githubUserId: 101, githubLogin: "alice" }, {
+      github: {
+        getPullRequest: vi.fn(),
+        getTaskSnapshot: vi.fn(),
+        dispatchVerification,
+        getVerificationArtifact: vi.fn(),
+      },
+      notion: { getIssue: vi.fn(), updateTechnicalStatus: vi.fn(), createIssue: vi.fn() },
+    });
+    const input = {
+      operationId: operationA,
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      environment: "develop" as const,
+      commitSha,
+    };
+
+    await expect(tools.requestVerification(input)).resolves.toMatchObject({
+      requestId: operationA,
+      status: "dispatch_failed",
+    });
+    await expect(tools.requestVerification(input)).resolves.toMatchObject({
+      requestId: operationA,
+      status: "dispatch_failed",
+    });
+    await expect(
+      tools.requestVerification({ ...input, operationId: operationB }),
+    ).resolves.toMatchObject({ requestId: operationB, status: "dispatch_failed" });
+    expect(dispatchVerification).toHaveBeenCalledTimes(2);
   });
 });
 

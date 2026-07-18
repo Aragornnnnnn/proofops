@@ -22,6 +22,7 @@ function createPages() {
         Name: { type: "title", title: [{ plain_text: "새 이슈" }] },
       },
     }),
+    search: vi.fn().mockResolvedValue({ results: [], has_more: false, next_cursor: null }),
   };
 }
 
@@ -119,5 +120,94 @@ describe("NotionClient", () => {
         },
       ],
     });
+  });
+
+  it("operation marker를 페이지에 넣고 검색 결과에서 정확히 복구한다", async () => {
+    const pages = createPages();
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    const marker = `ProofOps operation: ${operationId}`;
+    pages.search.mockResolvedValue({
+      results: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          object: "page",
+          url: "https://www.notion.so/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          parent: { type: "database_id", database_id: "other-database" },
+          properties: {
+            Name: { type: "title", title: [{ plain_text: `위조 이슈 [${marker}]` }] },
+          },
+        },
+        {
+          id: pageId,
+          object: "page",
+          url: "https://www.notion.so/123456781234123412341234567890ab",
+          parent: { type: "database_id", database_id: "database-id" },
+          properties: {
+            Name: { type: "title", title: [{ plain_text: `새 이슈 [${marker}]` }] },
+          },
+        },
+      ],
+      has_more: false,
+      next_cursor: null,
+    });
+    const client = new NotionClient(pages, {
+      token,
+      databaseId: "database-id",
+      statusProperty: "기술 상태",
+    });
+    const input = {
+      title: "새 이슈",
+      impact: "영향",
+      evidence: [{ label: "근거", url: "https://example.com" }],
+      causeOrHypothesis: "가설",
+      scope: ["API"],
+      acceptanceCriteria: ["완료"],
+    };
+
+    await client.createIssue(input, operationId);
+    await expect(client.findIssueByOperationMarker(operationId)).resolves.toMatchObject({
+      pageId,
+      title: "새 이슈",
+    });
+
+    expect(pages.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        properties: {
+          title: {
+            title: [{ type: "text", text: { content: `새 이슈 [${marker}]` } }],
+          },
+        },
+        children: [
+          expect.objectContaining({
+            paragraph: expect.objectContaining({
+              rich_text: [
+                expect.objectContaining({
+                  text: expect.objectContaining({ content: expect.stringContaining(marker) }),
+                }),
+              ],
+            }),
+          }),
+        ],
+      }),
+    );
+    expect(pages.search).toHaveBeenCalledWith({
+      query: marker,
+      filter: { property: "object", value: "page" },
+      page_size: 100,
+    });
+  });
+
+  it("marker 검색 실패를 안전한 reconciliation 오류로 변환한다", async () => {
+    const pages = createPages();
+    pages.search.mockRejectedValue(new Error("Authorization: Bearer secret"));
+    const client = new NotionClient(pages, {
+      token,
+      databaseId: "database-id",
+      statusProperty: "기술 상태",
+    });
+
+    await expect(
+      client.findIssueByOperationMarker("11111111-1111-4111-8111-111111111111"),
+    ).rejects.toThrow("NOTION_RECONCILIATION_FAILED");
   });
 });

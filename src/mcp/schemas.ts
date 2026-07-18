@@ -12,8 +12,17 @@ const technicalStatusSchema = z.enum([
   "Failed",
 ]);
 
+const operationIdSchema = z.uuid();
+
 export const startTaskInputSchema = z.object({
+  operationId: operationIdSchema,
   notionPageIdOrUrl: z.string().trim().min(1),
+});
+
+export const linkPullRequestInputSchema = z.object({
+  operationId: operationIdSchema,
+  taskId: z.string().trim().min(1),
+  pullRequestUrl: z.url().refine((value) => value.startsWith("https://github.com/")),
 });
 
 export const getTaskStatusInputSchema = z.object({
@@ -34,6 +43,7 @@ export const recordProgressInputSchema = z.object({
 });
 
 export const requestVerificationInputSchema = z.object({
+  operationId: operationIdSchema,
   taskId: z.string().trim().min(1).max(200),
   repository: z.string().regex(/^[^/\s]+\/[^/\s]+$/),
   environment: z.enum(["develop", "prod"]),
@@ -53,6 +63,7 @@ export const investigateIncidentInputSchema = z.object({
 });
 
 export const createNotionIssueInputSchema = z.object({
+  operationId: operationIdSchema,
   title: z.string().trim().min(1).max(200),
   impact: z.string().trim().min(1).max(4_000),
   evidence: z.array(evidenceLinkSchema).min(1).max(20),
@@ -84,6 +95,7 @@ export const progressNoteSchema = z.object({
 export const verificationDispatchSchema = z.object({
   requestId: z.string().uuid(),
   workflowRunUrl: z.string().url(),
+  status: z.string(),
 });
 
 export const incidentEvidenceSchema = z.object({

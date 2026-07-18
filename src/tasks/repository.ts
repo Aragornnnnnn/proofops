@@ -78,7 +78,14 @@ export async function upsertPullRequest(
   db: D1Database,
   input: PullRequestInput,
 ): Promise<void> {
-  await db
+  await prepareUpsertPullRequest(db, input).run();
+}
+
+export function prepareUpsertPullRequest(
+  db: D1Database,
+  input: PullRequestInput,
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO pull_requests (
         id, task_id, repository, pr_number, pr_url, state,
@@ -109,8 +116,7 @@ export async function upsertPullRequest(
       input.headSha,
       input.updatedAt,
       input.updatedAt,
-    )
-    .run();
+    );
 }
 
 export async function recordWebhookDelivery(

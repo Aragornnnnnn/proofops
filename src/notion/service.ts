@@ -28,5 +28,6 @@ export interface EvidenceLink {
 export interface NotionPort {
   getIssue(pageIdOrUrl: string): Promise<NotionIssue>;
   updateTechnicalStatus(pageId: string, status: string): Promise<void>;
-  createIssue(input: CreateIssueInput): Promise<NotionIssue>;
+  createIssue(input: CreateIssueInput, operationId?: string): Promise<NotionIssue>;
+  findIssueByOperationMarker?(operationId: string): Promise<NotionIssue | null>;
 }

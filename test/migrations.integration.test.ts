@@ -6,6 +6,7 @@ import linkedAtMigration from "../migrations/0002_pull_request_linked_at.sql?raw
 import verificationRequestsMigration from "../migrations/0003_verification_requests.sql?raw";
 import actorAuditMigration from "../migrations/0004_actor_audit.sql?raw";
 import reviewSecurityMigration from "../migrations/0005_review_security.sql?raw";
+import operationLifecycleMigration from "../migrations/0006_operation_lifecycle.sql?raw";
 
 const migrationFiles = [
   initialMigration,
@@ -13,6 +14,7 @@ const migrationFiles = [
   verificationRequestsMigration,
   actorAuditMigration,
   reviewSecurityMigration,
+  operationLifecycleMigration,
 ];
 
 async function resetDatabase(): Promise<void> {
@@ -105,7 +107,14 @@ describe("D1 마이그레이션 체인", () => {
       .prepare("PRAGMA table_info(audit_events)")
       .all<{ name: string }>();
     expect(auditColumns.results.map(({ name }) => name)).toEqual(
-      expect.arrayContaining(["status", "idempotency_key", "updated_at", "error_code"]),
+      expect.arrayContaining([
+        "status",
+        "idempotency_key",
+        "updated_at",
+        "error_code",
+        "operation_id",
+        "input_hash",
+      ]),
     );
   });
 });

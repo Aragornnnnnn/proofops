@@ -275,11 +275,16 @@ beforeEach(async () => {
         status TEXT NOT NULL DEFAULT 'succeeded',
         idempotency_key TEXT,
         updated_at TEXT,
-        error_code TEXT
+        error_code TEXT,
+        operation_id TEXT,
+        input_hash TEXT
       )`),
     env.DB.prepare(`
       CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_key_idx
       ON audit_events(idempotency_key) WHERE idempotency_key IS NOT NULL`),
+    env.DB.prepare(`
+      CREATE UNIQUE INDEX IF NOT EXISTS audit_events_operation_id_idx
+      ON audit_events(operation_id) WHERE operation_id IS NOT NULL`),
     env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS mcp_sessions (
         session_id TEXT PRIMARY KEY,
@@ -669,13 +674,17 @@ describe("POST /mcp", () => {
       [
         "start",
         "start_task",
-        { notionPageIdOrUrl: "11111111-1111-1111-1111-111111111111" },
+        {
+          operationId: "20000000-0000-4000-8000-000000000001",
+          notionPageIdOrUrl: "11111111-1111-1111-1111-111111111111",
+        },
         "NOTION_READ_FAILED",
       ],
       [
         "link",
         "link_pull_request",
         {
+          operationId: "20000000-0000-4000-8000-000000000002",
           taskId: "missing-task",
           pullRequestUrl: "https://github.com/attacker/other/pull/1",
         },
