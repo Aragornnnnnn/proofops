@@ -7,15 +7,15 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "proofops-local",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_name": "proofops",
+      "database_id": "79d1de67-f18d-46b4-a672-df2c232ba553",
       "migrations_dir": "migrations"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
-      "id": "00000000000000000000000000000000"
+      "id": "cda3cf7d082d4fdf8e66313a30852bc3"
     }
   ],
   "durable_objects": {
@@ -33,7 +33,7 @@
     }
   ],
   "vars": {
-    "ENVIRONMENT": "local",
+    "ENVIRONMENT": "production",
     "SENTRY_ORG_SLUG": "landit",
     "SENTRY_PROJECT_SLUG": "proofops"
   }
