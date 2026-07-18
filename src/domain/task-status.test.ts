@@ -12,6 +12,9 @@ const cases: Array<[string, TaskSnapshot, TechnicalStatus]> = [
   ["검증 대기", { started: true, pullRequests: [{ state: "merged", review: "approved", ci: "passed" }], deployment: "succeeded", requiredVerification: "pending" }, "Verifying"],
   ["완료", { started: true, pullRequests: [{ state: "merged", review: "approved", ci: "passed" }], deployment: "succeeded", requiredVerification: "passed" }, "Done"],
   ["관측 불가", { started: true, pullRequests: [{ state: "merged", review: "approved", ci: "passed" }], deployment: "succeeded", requiredVerification: "unobservable" }, "Failed"],
+  ["다중 PR 중 CI 실패", { started: true, pullRequests: [{ state: "merged", review: "approved", ci: "passed" }, { state: "open", review: "approved", ci: "failed" }], deployment: "succeeded", requiredVerification: "passed" }, "Blocked"],
+  ["다중 PR 중 수정 요청", { started: true, pullRequests: [{ state: "merged", review: "approved", ci: "passed" }, { state: "open", review: "changes_requested", ci: "passed" }], deployment: "succeeded", requiredVerification: "passed" }, "Changes Requested"],
+  ["필수 검증 실패 우선", { started: true, pullRequests: [{ state: "open", review: "approved", ci: "passed" }], deployment: "succeeded", requiredVerification: "failed" }, "Failed"],
 ];
 
 describe("deriveTechnicalStatus", () => {
