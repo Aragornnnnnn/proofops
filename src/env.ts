@@ -8,6 +8,7 @@ export interface Env {
 declare global {
   namespace Cloudflare {
     interface Env {
+      DB: D1Database;
       ENVIRONMENT: "local" | "preview" | "production";
     }
   }
