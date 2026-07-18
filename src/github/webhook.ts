@@ -91,7 +91,12 @@ export async function handleGitHubWebhook(
     }
     await reconcileTask(dependencies, linked.taskId);
     return jsonResponse(202, "processed");
-  } catch {
+  } catch (error) {
+    console.error("github_webhook_processing_failed", {
+      deliveryId,
+      event,
+      message: error instanceof Error ? error.message : "unknown_error",
+    });
     await dependencies.db
       .prepare(
         "DELETE FROM webhook_deliveries WHERE provider = 'github' AND delivery_id = ?",

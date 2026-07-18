@@ -71,30 +71,36 @@ export class GitHubAppClient implements GitHubPort {
   constructor(
     private readonly db: D1Database,
     private readonly config: GitHubAppConfig,
-    private readonly fetcher: typeof fetch = fetch,
+    private readonly fetcher: typeof fetch = (input, init) => fetch(input, init),
   ) {}
 
   async getPullRequest(url: string): Promise<LinkedPullRequestSnapshot> {
     const reference = parsePullRequestUrl(url);
+    let stage = "create_app_auth";
     try {
       const auth = createAppAuth({
         appId: this.config.appId,
         privateKey: this.config.privateKey.replaceAll("\\n", "\n"),
       });
+      stage = "authenticate_app";
       const appAuthentication = await auth({ type: "app" });
+      stage = "read_installation";
       const installation = await this.request<{ id: number }>(
         `/repos/${reference.owner}/${reference.repositoryName}/installation`,
         appAuthentication.token,
       );
+      stage = "authenticate_installation";
       const installationAuthentication = await auth({
         type: "installation",
         installationId: installation.id,
       });
       const path = `/repos/${reference.owner}/${reference.repositoryName}`;
+      stage = "read_pull_request";
       const pullRequest = await this.request<PullRequestApiResponse>(
         `${path}/pulls/${reference.number}`,
         installationAuthentication.token,
       );
+      stage = "read_reviews_and_checks";
       const [reviews, checks] = await Promise.all([
         collectGitHubPages(async (page, perPage) => {
           const response = await this.request<ReviewApiResponse[]>(
@@ -125,7 +131,13 @@ export class GitHubAppClient implements GitHubPort {
         review: deriveCurrentReviewState(reviews),
         ci: deriveCiState(checks),
       };
-    } catch {
+    } catch (error) {
+      console.error("github_pull_request_read_failed", {
+        repository: `${reference.owner}/${reference.repositoryName}`,
+        number: reference.number,
+        stage,
+        message: error instanceof Error ? error.message : "unknown_error",
+      });
       throw new Error("GITHUB_READ_FAILED");
     }
   }
@@ -313,7 +325,14 @@ export class GitHubAppClient implements GitHubPort {
     const response = await this.fetcher(`https://api.github.com${path}`, {
       headers: this.githubHeaders(token),
     });
-    if (!response.ok) throw new Error("GITHUB_API_FAILED");
+    if (!response.ok) {
+      console.error("github_api_request_failed", {
+        path,
+        status: response.status,
+        requestId: response.headers.get("x-github-request-id"),
+      });
+      throw new Error("GITHUB_API_FAILED");
+    }
     return (await response.json()) as T;
   }
 

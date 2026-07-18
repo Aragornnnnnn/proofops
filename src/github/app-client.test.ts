@@ -8,6 +8,73 @@ import {
 } from "./app-client";
 import { deriveTechnicalStatus } from "../domain/task-status";
 
+vi.mock("@octokit/auth-app", () => ({
+  createAppAuth: () =>
+    vi.fn(async (input: { type: string }) => ({
+      token: input.type === "app" ? "app-token" : "installation-token",
+    })),
+}));
+
+describe("GitHubAppClient.getPullRequest", () => {
+  it("Worker 전역 fetch를 this 바인딩 없이 호출한다", async () => {
+    const headSha = "a".repeat(40);
+    const workerFetch = vi.fn(async function (
+      this: unknown,
+      input: RequestInfo | URL,
+    ): Promise<Response> {
+      if (this !== undefined) throw new TypeError("Illegal invocation");
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.endsWith("/installation")) return json({ id: 1001 });
+      if (url.endsWith("/pulls/1")) {
+        return json({
+          html_url: "https://github.com/Aragornnnnnn/proofops-sandbox/pull/1",
+          state: "open",
+          merged: false,
+          merged_at: null,
+          head: { sha: headSha },
+          base: { repo: { full_name: "Aragornnnnnn/proofops-sandbox" } },
+          number: 1,
+        });
+      }
+      if (url.includes("/reviews?")) return json([]);
+      if (url.includes("/check-runs?")) {
+        return json({
+          check_runs: [{ status: "completed", conclusion: "success" }],
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal("fetch", workerFetch);
+
+    try {
+      const client = new GitHubAppClient({} as D1Database, {
+        appId: "1",
+        privateKey: "test-key",
+      });
+
+      await expect(
+        client.getPullRequest(
+          "https://github.com/Aragornnnnnn/proofops-sandbox/pull/1",
+        ),
+      ).resolves.toMatchObject({
+        repository: "Aragornnnnnn/proofops-sandbox",
+        number: 1,
+        headSha,
+        state: "open",
+        review: "pending",
+        ci: "passed",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("deriveCurrentReviewState", () => {
   it("같은 리뷰어의 이전 변경 요청 뒤 승인을 현재 상태로 사용한다", () => {
     const reviews: GitHubReview[] = [
