@@ -82,8 +82,8 @@ export async function upsertPullRequest(
     .prepare(
       `INSERT INTO pull_requests (
         id, task_id, repository, pr_number, pr_url, state,
-        review_state, ci_state, head_sha, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        review_state, ci_state, head_sha, linked_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(repository, pr_number) DO UPDATE SET
         task_id = excluded.task_id,
         pr_url = excluded.pr_url,
@@ -103,6 +103,7 @@ export async function upsertPullRequest(
       input.reviewState,
       input.ciState,
       input.headSha,
+      input.updatedAt,
       input.updatedAt,
     )
     .run();

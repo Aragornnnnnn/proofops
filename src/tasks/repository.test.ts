@@ -35,6 +35,7 @@ beforeEach(async () => {
       review_state TEXT NOT NULL,
       ci_state TEXT NOT NULL,
       head_sha TEXT NOT NULL,
+      linked_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repository, pr_number)
     )`),
@@ -147,6 +148,75 @@ describe("D1 작업 연결 저장소", () => {
           state: "merged",
           ci_state: "passed",
           head_sha: "second-sha",
+        },
+      ],
+    });
+  });
+
+  it("늦은 상태 관측이 최초 PR 연결 시점을 덮어쓰지 않는다", async () => {
+    await createTask(env.DB, {
+      id: "task-1",
+      notionPageId: "notion-page-1",
+      notionUrl: "https://notion.so/task-1",
+      title: "연결 순서 보존",
+      technicalStatus: "In Progress",
+      expectedRepositories: ["landit-be"],
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-10",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 10,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+      state: "open",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "old",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-11",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 11,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+      state: "open",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "new",
+      updatedAt: "2026-07-18T00:10:00.000Z",
+    });
+    await upsertPullRequest(env.DB, {
+      id: "pr-10-retry",
+      taskId: "task-1",
+      repository: "Aragornnnnnn/landit-be",
+      prNumber: 10,
+      prUrl: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+      state: "merged",
+      reviewState: "approved",
+      ciState: "passed",
+      headSha: "old-merged",
+      updatedAt: "2026-07-18T00:20:00.000Z",
+    });
+
+    await expect(
+      env.DB
+        .prepare("SELECT pr_number, state, linked_at, updated_at FROM pull_requests ORDER BY pr_number")
+        .all(),
+    ).resolves.toMatchObject({
+      results: [
+        {
+          pr_number: 10,
+          state: "merged",
+          linked_at: "2026-07-18T00:00:00.000Z",
+          updated_at: "2026-07-18T00:20:00.000Z",
+        },
+        {
+          pr_number: 11,
+          state: "open",
+          linked_at: "2026-07-18T00:10:00.000Z",
         },
       ],
     });

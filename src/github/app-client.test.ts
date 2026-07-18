@@ -6,6 +6,7 @@ import {
   GitHubAppClient,
   type GitHubReview,
 } from "./app-client";
+import { deriveTechnicalStatus } from "../domain/task-status";
 
 describe("deriveCurrentReviewState", () => {
   it("같은 리뷰어의 이전 변경 요청 뒤 승인을 현재 상태로 사용한다", () => {
@@ -113,5 +114,61 @@ describe("GitHubAppClient.getTaskSnapshot", () => {
     expect(getPullRequest).not.toHaveBeenCalledWith(
       "https://github.com/Aragornnnnnn/landit-be/pull/10",
     );
+  });
+
+  it("늦은 이전 PR 상태 갱신보다 새로 연결된 열린 PR을 우선한다", async () => {
+    const database = {
+      prepare: (query: string) => ({
+        bind: () => ({
+          all: async () => ({
+            results: query.includes("linked_at DESC")
+              ? [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                  },
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+                  },
+                ]
+              : [
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/10",
+                  },
+                  {
+                    repository: "Aragornnnnnn/landit-be",
+                    pr_url: "https://github.com/Aragornnnnnn/landit-be/pull/11",
+                  },
+                ],
+          }),
+          first: async () => ({ expected_repositories: '["landit-be"]' }),
+        }),
+      }),
+    } as unknown as D1Database;
+    const client = new GitHubAppClient(database, { appId: "1", privateKey: "key" });
+    vi.spyOn(client, "getPullRequest").mockImplementation(async (url) => ({
+      repository: "Aragornnnnnn/landit-be",
+      number: url.endsWith("/11") ? 11 : 10,
+      url,
+      headSha: "current",
+      state: url.endsWith("/11") ? "open" : "merged",
+      review: "approved",
+      ci: "passed",
+    }));
+
+    const snapshot = await client.getTaskSnapshot("task-1");
+
+    expect(snapshot.pullRequests).toEqual([
+      expect.objectContaining({ number: 11, state: "open" }),
+    ]);
+    expect(
+      deriveTechnicalStatus({
+        ...snapshot,
+        deployment: "succeeded",
+        requiredVerification: "passed",
+      }),
+    ).not.toBe("Done");
   });
 });

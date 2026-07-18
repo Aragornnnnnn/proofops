@@ -84,6 +84,7 @@ beforeEach(async () => {
         review_state TEXT NOT NULL,
         ci_state TEXT NOT NULL,
         head_sha TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`),
     env.DB.prepare("DELETE FROM pull_requests"),

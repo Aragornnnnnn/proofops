@@ -107,8 +107,8 @@ async function insertTaskAndPullRequest(): Promise<void> {
       .prepare(
         `INSERT INTO pull_requests (
           id, task_id, repository, pr_number, pr_url, state,
-          review_state, ci_state, head_sha, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          review_state, ci_state, head_sha, linked_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         "pr-1",
@@ -120,6 +120,7 @@ async function insertTaskAndPullRequest(): Promise<void> {
         "pending",
         "pending",
         "old-sha",
+        timestamp,
         timestamp,
       ),
   ]);
@@ -151,6 +152,7 @@ beforeEach(async () => {
         review_state TEXT NOT NULL,
         ci_state TEXT NOT NULL,
         head_sha TEXT NOT NULL,
+        linked_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(repository, pr_number)
       )`),

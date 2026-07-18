@@ -124,7 +124,7 @@ export class GitHubAppClient implements GitHubPort {
 
   async getTaskSnapshot(taskId: string): Promise<TaskSnapshot> {
     const rows = await this.db
-      .prepare("SELECT repository, pr_url FROM pull_requests WHERE task_id = ? ORDER BY updated_at DESC, pr_number DESC")
+      .prepare("SELECT repository, pr_url FROM pull_requests WHERE task_id = ? ORDER BY linked_at DESC, pr_number DESC")
       .bind(taskId)
       .all<{ repository: string; pr_url: string }>();
     const task = await this.db
